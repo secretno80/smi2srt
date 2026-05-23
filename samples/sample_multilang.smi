@@ -1,0 +1,20 @@
+<SAMI>
+<HEAD>
+<STYLE TYPE="text/css">
+<!--
+P { margin-left:2pt; margin-right:2pt; margin-bottom:1pt; margin-top:1pt;
+    text-align:center; font-size:20pt; font-family:Arial; font-weight:normal; color:white; }
+.KRCC { Name:Korean; lang:ko-KR; SAMIType:CC; }
+.ENCC { Name:English; lang:en-US; SAMIType:CC; }
+-->
+</STYLE>
+</HEAD>
+<BODY>
+<SYNC Start=0><P Class=KRCC>안녕하세요<br>테스트입니다.
+<P Class=ENCC>Hello<br>This is a test.
+<SYNC Start=1800><P Class=KRCC>두 번째 줄입니다.
+<P Class=ENCC>Second line.
+<SYNC Start=3600><P Class=KRCC>&nbsp;
+<P Class=ENCC>&nbsp;
+</BODY>
+</SAMI>

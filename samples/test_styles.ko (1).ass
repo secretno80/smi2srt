@@ -1,0 +1,23 @@
+﻿[Script Info]
+Title: subConverter
+ScriptType: v4.00+
+PlayResX: 1280
+PlayResY: 720
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,36,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,2,1,2,20,20,20,0
+Style: Bold,Arial,36,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,1,0,0,0,100,100,0,0,1,2,1,2,20,20,20,0
+Style: Clr_87CEEB_Italic,Arial,36,&H00EBCE87,&H000000FF,&H00000000,&H64000000,0,1,0,0,100,100,0,0,1,2,1,2,20,20,20,0
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:01.00,0:00:04.99,Clr_87CEEB_Italic,,0,0,0,,이것은 나와 그녀만이\N알고 있는
+Dialogue: 0,0:00:05.00,0:00:08.99,Clr_87CEEB_Italic,,0,0,0,,두 번째 스카이블루 이탤릭
+Dialogue: 0,0:00:09.00,0:00:11.99,Bold,,0,0,0,,굵은 텍스트
+Dialogue: 0,0:00:12.00,0:00:14.99,Bold,,0,0,0,,또 다른 굵은 텍스트
+Dialogue: 0,0:00:15.00,0:00:17.99,Default,,0,0,0,,{\b1}{\c&H00FFFF&}노란 굵은
+Dialogue: 0,0:00:18.00,0:00:20.99,Default,,0,0,0,,{\b1}굵은 {\i1}중간만 기울임{\i0} 굵은
+Dialogue: 0,0:00:21.00,0:00:23.99,Default,,0,0,0,,일반 텍스트

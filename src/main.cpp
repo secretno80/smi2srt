@@ -1,0 +1,2185 @@
+#define NOMINMAX
+#include <windows.h>
+#include <shellapi.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <cstdlib>
+#include <filesystem>
+#include <map>
+#include <mutex>
+#include <regex>
+#include <sstream>
+#include <set>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace fs = std::filesystem;
+
+struct Caption {
+    int startMs;
+    int endMs;
+    std::wstring text;
+    std::wstring rawHtml; // Original HTML from SMI source (empty if not from SMI)
+    std::string lang;
+};
+
+struct ConvertResult {
+    bool ok;
+    std::wstring message;
+};
+
+enum class TargetFormat {
+    ToSmi,
+    ToSrt,
+    ToAss
+};
+
+std::wstring Trim(const std::wstring& value) {
+    size_t begin = 0;
+    while (begin < value.size() && std::iswspace(value[begin])) {
+        ++begin;
+    }
+    size_t end = value.size();
+    while (end > begin && std::iswspace(value[end - 1])) {
+        --end;
+    }
+    return value.substr(begin, end - begin);
+}
+
+std::wstring ToLowerW(std::wstring value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](wchar_t ch) {
+        return static_cast<wchar_t>(std::towlower(ch));
+    });
+    return value;
+}
+
+std::string ToLowerA(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+std::wstring MultiByteToWide(const std::string& input, UINT codePage) {
+    if (input.empty()) {
+        return L"";
+    }
+
+    int needed = MultiByteToWideChar(codePage, 0, input.c_str(), static_cast<int>(input.size()), nullptr, 0);
+    if (needed <= 0) {
+        return L"";
+    }
+
+    std::wstring result(static_cast<size_t>(needed), L'\0');
+    MultiByteToWideChar(codePage, 0, input.c_str(), static_cast<int>(input.size()), result.data(), needed);
+    return result;
+}
+
+bool IsValidUtf8(const std::string& bytes) {
+    int continuation = 0;
+    for (unsigned char ch : bytes) {
+        if (continuation == 0) {
+            if ((ch >> 7) == 0b0) {
+                continue;
+            }
+            if ((ch >> 5) == 0b110) {
+                continuation = 1;
+                continue;
+            }
+            if ((ch >> 4) == 0b1110) {
+                continuation = 2;
+                continue;
+            }
+            if ((ch >> 3) == 0b11110) {
+                continuation = 3;
+                continue;
+            }
+            return false;
+        }
+
+        if ((ch >> 6) != 0b10) {
+            return false;
+        }
+        --continuation;
+    }
+    return continuation == 0;
+}
+
+std::wstring DecodeToWide(const std::string& bytes) {
+    if (bytes.size() >= 3 &&
+        static_cast<unsigned char>(bytes[0]) == 0xEF &&
+        static_cast<unsigned char>(bytes[1]) == 0xBB &&
+        static_cast<unsigned char>(bytes[2]) == 0xBF) {
+        return MultiByteToWide(bytes.substr(3), CP_UTF8);
+    }
+
+    if (bytes.size() >= 2 &&
+        static_cast<unsigned char>(bytes[0]) == 0xFF &&
+        static_cast<unsigned char>(bytes[1]) == 0xFE) {
+        std::wstring out;
+        for (size_t i = 2; i + 1 < bytes.size(); i += 2) {
+            wchar_t ch = static_cast<wchar_t>(
+                static_cast<unsigned char>(bytes[i]) |
+                (static_cast<unsigned char>(bytes[i + 1]) << 8));
+            out.push_back(ch);
+        }
+        return out;
+    }
+
+    if (bytes.size() >= 2 &&
+        static_cast<unsigned char>(bytes[0]) == 0xFE &&
+        static_cast<unsigned char>(bytes[1]) == 0xFF) {
+        std::wstring out;
+        for (size_t i = 2; i + 1 < bytes.size(); i += 2) {
+            wchar_t ch = static_cast<wchar_t>(
+                (static_cast<unsigned char>(bytes[i]) << 8) |
+                static_cast<unsigned char>(bytes[i + 1]));
+            out.push_back(ch);
+        }
+        return out;
+    }
+
+    if (IsValidUtf8(bytes)) {
+        std::wstring utf8 = MultiByteToWide(bytes, CP_UTF8);
+        if (!utf8.empty()) {
+            return utf8;
+        }
+    }
+
+    std::wstring cp949 = MultiByteToWide(bytes, 949);
+    if (!cp949.empty()) {
+        return cp949;
+    }
+
+    return MultiByteToWide(bytes, CP_ACP);
+}
+
+std::wstring DecodeHtmlEntities(std::wstring input) {
+    static const std::vector<std::pair<std::wstring, std::wstring>> entities = {
+        {L"&nbsp;", L" "},
+        {L"&amp;", L"&"},
+        {L"&lt;", L"<"},
+        {L"&gt;", L">"},
+        {L"&quot;", L"\""},
+        {L"&#39;", L"'"}
+    };
+
+    for (const auto& pair : entities) {
+        size_t pos = 0;
+        while ((pos = input.find(pair.first, pos)) != std::wstring::npos) {
+            input.replace(pos, pair.first.size(), pair.second);
+            pos += pair.second.size();
+        }
+    }
+
+    std::wregex numericEntity(LR"(&#(\d+);)");
+    std::wsmatch match;
+    std::wstring result;
+    std::wstring::const_iterator searchStart(input.cbegin());
+
+    while (std::regex_search(searchStart, input.cend(), match, numericEntity)) {
+        result.append(searchStart, match[0].first);
+        int code = std::stoi(match[1].str());
+        result.push_back(static_cast<wchar_t>(code));
+        searchStart = match[0].second;
+    }
+    result.append(searchStart, input.cend());
+    return result;
+}
+
+std::wstring NormalizeSubtitleText(std::wstring html) {
+    html = std::regex_replace(html, std::wregex(LR"(<br\s*/?>)", std::regex_constants::icase), L"\n");
+    html = std::regex_replace(html, std::wregex(LR"(<[^>]+>)"), L"");
+    html = DecodeHtmlEntities(html);
+
+    std::wstringstream in(html);
+    std::wstring line;
+    std::vector<std::wstring> lines;
+
+    while (std::getline(in, line)) {
+        std::wstring trimmed = Trim(line);
+        if (!trimmed.empty()) {
+            lines.push_back(trimmed);
+        }
+    }
+
+    std::wstring out;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        out += lines[i];
+        if (i + 1 < lines.size()) {
+            out += L"\n";
+        }
+    }
+    return out;
+}
+
+// Parse a CSS/HTML color value (#RRGGBB, #RGB, or named color) into ASS &HBBGGRR& format.
+std::wstring ParseColorToAss(const std::wstring& colorStr) {
+    std::wstring s = Trim(colorStr);
+    if (s.size() >= 2 &&
+        (s.front() == L'"' || s.front() == L'\'') &&
+        s.back() == s.front()) {
+        s = s.substr(1, s.size() - 2);
+    }
+    s = Trim(s);
+    std::wstring lower = ToLowerW(s);
+
+    if (!lower.empty() && lower[0] == L'#') {
+        std::wstring hex = lower.substr(1);
+        int r = 0, g = 0, b = 0;
+        try {
+            if (hex.size() == 6) {
+                r = std::stoi(hex.substr(0, 2), nullptr, 16);
+                g = std::stoi(hex.substr(2, 2), nullptr, 16);
+                b = std::stoi(hex.substr(4, 2), nullptr, 16);
+            } else if (hex.size() == 3) {
+                int r1 = std::stoi(std::wstring(1, hex[0]), nullptr, 16);
+                int g1 = std::stoi(std::wstring(1, hex[1]), nullptr, 16);
+                int b1 = std::stoi(std::wstring(1, hex[2]), nullptr, 16);
+                r = r1 * 17; g = g1 * 17; b = b1 * 17;
+            } else {
+                return L"";
+            }
+        } catch (...) { return L""; }
+        wchar_t buf[24];
+        swprintf_s(buf, L"&H%02X%02X%02X&", b, g, r);
+        return buf;
+    }
+
+    static const std::map<std::wstring, std::tuple<int, int, int>> namedColors = {
+        {L"white",          {255, 255, 255}}, {L"yellow",        {255, 255,   0}},
+        {L"red",            {255,   0,   0}}, {L"lime",          {  0, 255,   0}},
+        {L"green",          {  0, 128,   0}}, {L"blue",          {  0,   0, 255}},
+        {L"cyan",           {  0, 255, 255}}, {L"aqua",          {  0, 255, 255}},
+        {L"magenta",        {255,   0, 255}}, {L"fuchsia",       {255,   0, 255}},
+        {L"black",          {  0,   0,   0}}, {L"gray",          {128, 128, 128}},
+        {L"grey",           {128, 128, 128}}, {L"silver",        {192, 192, 192}},
+        {L"orange",         {255, 165,   0}}, {L"pink",          {255, 192, 203}},
+        {L"purple",         {128,   0, 128}}, {L"maroon",        {128,   0,   0}},
+        {L"olive",          {128, 128,   0}}, {L"navy",          {  0,   0, 128}},
+        {L"teal",           {  0, 128, 128}},
+        // Extended CSS named colors commonly used in SMI files
+        {L"skyblue",        {135, 206, 235}}, {L"lightblue",     {173, 216, 230}},
+        {L"deepskyblue",    {  0, 191, 255}}, {L"dodgerblue",    { 30, 144, 255}},
+        {L"cornflowerblue", {100, 149, 237}}, {L"royalblue",     { 65, 105, 225}},
+        {L"steelblue",      { 70, 130, 180}}, {L"cadetblue",     { 95, 158, 160}},
+        {L"darkblue",       {  0,   0, 139}}, {L"mediumblue",    {  0,   0, 205}},
+        {L"lightgreen",     {144, 238, 144}}, {L"limegreen",     { 50, 205,  50}},
+        {L"forestgreen",    { 34, 139,  34}}, {L"darkgreen",     {  0, 100,   0}},
+        {L"seagreen",       { 46, 139,  87}}, {L"mediumseagreen",{ 60, 179, 113}},
+        {L"springgreen",    {  0, 255, 127}}, {L"palegreen",     {152, 251, 152}},
+        {L"darkseagreen",   {143, 188, 143}},
+        {L"lightyellow",    {255, 255, 224}}, {L"gold",          {255, 215,   0}},
+        {L"khaki",          {240, 230, 140}}, {L"darkkhaki",     {189, 183, 107}},
+        {L"lightpink",      {255, 182, 193}}, {L"hotpink",       {255, 105, 180}},
+        {L"deeppink",       {255,  20, 147}}, {L"coral",         {255, 127,  80}},
+        {L"salmon",         {250, 128, 114}}, {L"tomato",        {255,  99,  71}},
+        {L"orangered",      {255,  69,   0}}, {L"darkorange",    {255, 140,   0}},
+        {L"crimson",        {220,  20,  60}}, {L"darkred",       {139,   0,   0}},
+        {L"violet",         {238, 130, 238}}, {L"orchid",        {218, 112, 214}},
+        {L"plum",           {221, 160, 221}}, {L"indigo",        { 75,   0, 130}},
+        {L"mediumpurple",   {147, 112, 219}}, {L"blueviolet",    {138,  43, 226}},
+        {L"darkorchid",     {153,  50, 204}}, {L"darkviolet",    {148,   0, 211}},
+        {L"turquoise",      { 64, 224, 208}}, {L"mediumturquoise",{72, 209, 204}},
+        {L"darkturquoise",  {  0, 206, 209}}, {L"lightcyan",     {224, 255, 255}},
+        {L"lightgray",      {211, 211, 211}}, {L"lightgrey",     {211, 211, 211}},
+        {L"darkgray",       {169, 169, 169}}, {L"darkgrey",      {169, 169, 169}},
+        {L"dimgray",        {105, 105, 105}}, {L"dimgrey",       {105, 105, 105}},
+        {L"gainsboro",      {220, 220, 220}}, {L"whitesmoke",    {245, 245, 245}},
+        {L"brown",          {165,  42,  42}}, {L"sienna",        {160,  82,  45}},
+        {L"chocolate",      {210, 105,  30}}, {L"tan",           {210, 180, 140}},
+        {L"wheat",          {245, 222, 179}}, {L"beige",         {245, 245, 220}},
+        {L"lavender",       {230, 230, 250}}, {L"thistle",       {216, 191, 216}},
+        {L"ivory",          {255, 255, 240}}, {L"snow",          {255, 250, 250}},
+    };
+    auto it = namedColors.find(lower);
+    if (it != namedColors.end()) {
+        auto& [r, g, b] = it->second;
+        wchar_t buf[24];
+        swprintf_s(buf, L"&H%02X%02X%02X&", b, g, r);
+        return buf;
+    }
+    return L"";
+}
+
+// Extract the value of a named attribute from a raw HTML tag content string.
+std::wstring ExtractTagAttr(const std::wstring& tagContent, const std::wstring& attrName) {
+    std::wregex re(attrName + LR"ATTR(\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]*)))ATTR",
+                   std::regex_constants::icase);
+    std::wsmatch m;
+    if (std::regex_search(tagContent, m, re)) {
+        if (m[1].matched) return m[1].str();
+        if (m[2].matched) return m[2].str();
+        return m[3].str();
+    }
+    return L"";
+}
+
+// Convert SMI inner-HTML (inside a <p> block) to ASS dialogue text,
+// mapping <b>, <i>, <u>, <s>/<strike>, <font color/size>, and <br> to
+// the corresponding ASS override codes.
+std::wstring SmiHtmlToAssText(const std::wstring& html) {
+    std::wstring out;
+    out.reserve(html.size());
+    size_t pos = 0;
+
+    // Track font-tag nesting so we can restore previous state on </font>.
+    struct FontFrame { bool hadColor; bool hadSize; };
+    std::vector<FontFrame> fontStack;
+
+    // Count open decoration tags so we can close any unclosed ones at the end.
+    int boldOpen = 0, italicOpen = 0, underOpen = 0, strikeOpen = 0;
+    int colorOpen = 0; // counts open font tags that set a color
+
+    while (pos < html.size()) {
+        if (html[pos] != L'<') {
+            out.push_back(html[pos]);
+            ++pos;
+            continue;
+        }
+
+        size_t closePos = html.find(L'>', pos);
+        if (closePos == std::wstring::npos) {
+            // Unclosed '<', emit as-is and stop
+            out += html.substr(pos);
+            break;
+        }
+
+        std::wstring tagContent = html.substr(pos + 1, closePos - pos - 1);
+        // Strip optional trailing slash (self-closing)
+        std::wstring tagLower = ToLowerW(Trim(tagContent));
+        if (!tagLower.empty() && tagLower.back() == L'/') {
+            tagLower.pop_back();
+            tagLower = Trim(tagLower);
+        }
+        pos = closePos + 1;
+
+        // <br> / <br /> / <br/> → line-break
+        if (tagLower == L"br" ||
+            tagLower.rfind(L"br ", 0) == 0 ||
+            tagLower.rfind(L"br\t", 0) == 0) {
+            out += L"\\N";
+            continue;
+        }
+
+        // <b>  </b>
+        if (tagLower == L"b")  { out += L"{\\b1}"; ++boldOpen;   continue; }
+        if (tagLower == L"/b") { if (boldOpen   > 0) { out += L"{\\b0}"; --boldOpen;   } continue; }
+
+        // <i>  </i>
+        if (tagLower == L"i")  { out += L"{\\i1}"; ++italicOpen; continue; }
+        if (tagLower == L"/i") { if (italicOpen > 0) { out += L"{\\i0}"; --italicOpen; } continue; }
+
+        // <u>  </u>
+        if (tagLower == L"u")  { out += L"{\\u1}"; ++underOpen;  continue; }
+        if (tagLower == L"/u") { if (underOpen  > 0) { out += L"{\\u0}"; --underOpen;  } continue; }
+
+        // <s> <strike>  </s> </strike>
+        if (tagLower == L"s" || tagLower == L"strike")   { out += L"{\\s1}"; ++strikeOpen; continue; }
+        if (tagLower == L"/s" || tagLower == L"/strike") { if (strikeOpen > 0) { out += L"{\\s0}"; --strikeOpen; } continue; }
+
+        // <font ...>
+        if (tagLower.rfind(L"font", 0) == 0 &&
+            (tagLower.size() == 4 || std::iswspace(tagLower[4]))) {
+            FontFrame frame{false, false};
+
+            std::wstring colorAttr = ExtractTagAttr(tagContent, L"color");
+            if (!colorAttr.empty()) {
+                std::wstring assColor = ParseColorToAss(colorAttr);
+                if (!assColor.empty()) {
+                    out += L"{\\c" + assColor + L"}";
+                    frame.hadColor = true;
+                    ++colorOpen;
+                }
+            }
+
+            std::wstring sizeAttr = ExtractTagAttr(tagContent, L"size");
+            if (!sizeAttr.empty()) {
+                try {
+                    int sz = std::stoi(sizeAttr);
+                    // HTML font size 1-7 → approximate pixel sizes
+                    static const int htmlSizePx[] = {8, 10, 12, 14, 18, 24, 24};
+                    if (sz >= 1 && sz <= 7) sz = htmlSizePx[sz - 1];
+                    if (sz > 0) {
+                        wchar_t buf[24];
+                        swprintf_s(buf, L"{\\fs%d}", sz);
+                        out += buf;
+                        frame.hadSize = true;
+                    }
+                } catch (...) {}
+            }
+
+            fontStack.push_back(frame);
+            continue;
+        }
+
+        // </font>
+        if (tagLower == L"/font") {
+            if (!fontStack.empty()) {
+                FontFrame& frame = fontStack.back();
+                if (frame.hadColor && colorOpen > 0) {
+                    out += L"{\\c&H00FFFFFF&}"; // reset to default white
+                    --colorOpen;
+                }
+                if (frame.hadSize) {
+                    out += L"{\\fs28}"; // reset to default size
+                }
+                fontStack.pop_back();
+            }
+            continue;
+        }
+
+        // All other tags (e.g. <p>, <span>, <SYNC>, etc.) are silently dropped.
+    }
+
+    // Close any unclosed formatting tags
+    for (int i = 0; i < boldOpen;   ++i) out += L"{\\b0}";
+    for (int i = 0; i < italicOpen; ++i) out += L"{\\i0}";
+    for (int i = 0; i < underOpen;  ++i) out += L"{\\u0}";
+    for (int i = 0; i < strikeOpen; ++i) out += L"{\\s0}";
+    for (int i = 0; i < colorOpen;  ++i) out += L"{\\c&H00FFFFFF&}";
+
+    // Decode HTML entities
+    out = DecodeHtmlEntities(out);
+
+    // Replace literal CR/LF with \N and normalise lines
+    std::wstring withLineBreaks;
+    withLineBreaks.reserve(out.size());
+    for (size_t i = 0; i < out.size(); ++i) {
+        if (out[i] == L'\r') {
+            withLineBreaks += L"\\N";
+            if (i + 1 < out.size() && out[i + 1] == L'\n') ++i;
+        } else if (out[i] == L'\n') {
+            withLineBreaks += L"\\N";
+        } else {
+            withLineBreaks.push_back(out[i]);
+        }
+    }
+
+    // Split on \N, trim each segment, drop empties, rejoin
+    std::vector<std::wstring> segments;
+    size_t start = 0;
+    size_t found = 0;
+    while ((found = withLineBreaks.find(L"\\N", start)) != std::wstring::npos) {
+        segments.push_back(Trim(withLineBreaks.substr(start, found - start)));
+        start = found + 2;
+    }
+    segments.push_back(Trim(withLineBreaks.substr(start)));
+
+    std::wstring result;
+    for (const auto& seg : segments) {
+        if (seg.empty()) continue;
+        if (!result.empty()) result += L"\\N";
+        result += seg;
+    }
+    return result;
+}
+
+std::wstring NormalizeForCreditDetection(const std::wstring& text) {
+    std::wstring lowered = ToLowerW(text);
+    lowered = std::regex_replace(lowered, std::wregex(LR"([^0-9a-z가-힣]+)"), L" ");
+    return Trim(lowered);
+}
+
+bool IsCreatorCreditCaption(const std::wstring& text) {
+    std::wstring normalized = NormalizeForCreditDetection(text);
+    if (normalized.empty()) {
+        return false;
+    }
+
+    static const std::vector<std::wstring> creditTokens = {
+        L"smi by",
+        L"sub by",
+        L"subtitle by",
+        L"sync by",
+        L"sync correction by",
+        L"sync corrections by",
+        L"correction by",
+        L"corrections by",
+        L"provided by",
+        L"modify by",
+        L"modified by",
+        L"converted by",
+        L"conversion by",
+        L"encoded by",
+        L"edited by",
+        L"ripped by",
+        L"번역 by",
+        L"자막 by",
+        L"제작 by",
+        L"싱크 by",
+        L"수정 by",
+        L"변환 by",
+        L"제공 by",
+        L"자막제작",
+        L"한글자막"
+    };
+
+    for (const auto& token : creditTokens) {
+        if (normalized.find(token) != std::wstring::npos) {
+            return true;
+        }
+    }
+
+    static const std::vector<std::wregex> creditPatterns = {
+        std::wregex(LR"(\b(sync|timing|correction|corrections|modify|modified|provided|converted|conversion|subtitle|encode|encoded|edit|edited|rip|ripped)\s+by\b)"),
+        std::wregex(LR"(\b(제작|수정|변환|싱크|제공|번역)\s*by\b)")
+    };
+
+    for (const auto& pattern : creditPatterns) {
+        if (std::regex_search(normalized, pattern)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void RemoveCreditCaptions(std::vector<Caption>& captions) {
+    if (captions.empty()) {
+        return;
+    }
+
+    // Remove credits from the front
+    size_t begin = 0;
+    while (begin < captions.size() && IsCreatorCreditCaption(captions[begin].text)) {
+        ++begin;
+    }
+
+    // Remove credits from the back
+    size_t end = captions.size();
+    while (end > begin && IsCreatorCreditCaption(captions[end - 1].text)) {
+        --end;
+    }
+
+    // Keep only non-credit captions (front to back boundaries)
+    if (begin > 0 || end < captions.size()) {
+        captions = std::vector<Caption>(captions.begin() + begin, captions.begin() + end);
+    }
+}
+
+bool IsSubtitleExtension(const std::wstring& extension) {
+    std::wstring ext = ToLowerW(extension);
+    return ext == L".smi" || ext == L".srt" || ext == L".ass";
+}
+
+int ParseSrtTimestamp(const std::wstring& value) {
+    std::wsmatch match;
+    if (!std::regex_match(value, match, std::wregex(LR"((\d{2}):(\d{2}):(\d{2}),(\d{3}))"))) {
+        return -1;
+    }
+
+    int hh = std::stoi(match[1].str());
+    int mm = std::stoi(match[2].str());
+    int ss = std::stoi(match[3].str());
+    int ms = std::stoi(match[4].str());
+    return (((hh * 60) + mm) * 60 + ss) * 1000 + ms;
+}
+
+int ParseAssTimestamp(const std::wstring& value) {
+    std::wsmatch match;
+    if (!std::regex_match(value, match, std::wregex(LR"((\d+):(\d{2}):(\d{2})\.(\d{2}))"))) {
+        return -1;
+    }
+
+    int hh = std::stoi(match[1].str());
+    int mm = std::stoi(match[2].str());
+    int ss = std::stoi(match[3].str());
+    int cs = std::stoi(match[4].str());
+    return (((hh * 60) + mm) * 60 + ss) * 1000 + (cs * 10);
+}
+
+std::wstring FormatTimestampAss(int totalMs) {
+    if (totalMs < 0) {
+        totalMs = 0;
+    }
+
+    int hours = totalMs / 2400000;
+    totalMs %= 2400000;
+    int minutes = totalMs / 60000;
+    totalMs %= 60000;
+    int seconds = totalMs / 1000;
+    int centis = (totalMs % 1000) / 10;
+
+    wchar_t buffer[32] = {};
+    swprintf_s(buffer, L"%d:%02d:%02d.%02d", hours, minutes, seconds, centis);
+    return buffer;
+}
+
+std::wstring NormalizePlainSubtitleText(const std::wstring& value) {
+    std::wstringstream in(value);
+    std::wstring line;
+    std::vector<std::wstring> lines;
+
+    while (std::getline(in, line)) {
+        std::wstring trimmed = Trim(line);
+        if (!trimmed.empty()) {
+            lines.push_back(trimmed);
+        }
+    }
+
+    std::wstring out;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        out += lines[i];
+        if (i + 1 < lines.size()) {
+            out += L"\n";
+        }
+    }
+    return out;
+}
+
+std::wstring StripAssOverrides(const std::wstring& text) {
+    std::wstring out = std::regex_replace(text, std::wregex(LR"(\{[^}]*\})"), L"");
+    size_t pos = 0;
+    while ((pos = out.find(L"\\N", pos)) != std::wstring::npos) {
+        out.replace(pos, 2, L"\n");
+    }
+    pos = 0;
+    while ((pos = out.find(L"\\n", pos)) != std::wstring::npos) {
+        out.replace(pos, 2, L"\n");
+    }
+    return NormalizePlainSubtitleText(out);
+}
+
+std::wstring EscapeHtml(const std::wstring& input) {
+    std::wstring out;
+    out.reserve(input.size() + 16);
+    for (wchar_t ch : input) {
+        if (ch == L'&') {
+            out += L"&amp;";
+        } else if (ch == L'<') {
+            out += L"&lt;";
+        } else if (ch == L'>') {
+            out += L"&gt;";
+        } else if (ch == L'\"') {
+            out += L"&quot;";
+        } else {
+            out.push_back(ch);
+        }
+    }
+    return out;
+}
+
+std::wstring ToSmiText(const std::wstring& plainText) {
+    std::wstring escaped = EscapeHtml(plainText);
+    size_t pos = 0;
+    while ((pos = escaped.find(L"\n", pos)) != std::wstring::npos) {
+        escaped.replace(pos, 1, L"<br>");
+        pos += 4;
+    }
+    return escaped;
+}
+
+std::vector<std::wstring> SplitAssCsv(const std::wstring& text, size_t expectedFields) {
+    std::vector<std::wstring> fields;
+    fields.reserve(expectedFields);
+
+    std::wstring current;
+    for (size_t i = 0; i < text.size(); ++i) {
+        wchar_t ch = text[i];
+        if (ch == L',' && fields.size() + 1 < expectedFields) {
+            fields.push_back(current);
+            current.clear();
+        } else {
+            current.push_back(ch);
+        }
+    }
+    fields.push_back(current);
+    return fields;
+}
+
+int ResolveCaptionEndMs(const std::vector<Caption>& items, size_t index) {
+    int startMs = std::max(0, items[index].startMs);
+    if (items[index].endMs > startMs) {
+        return items[index].endMs;
+    }
+
+    int endMs = startMs + 2000;
+    if (index + 1 < items.size()) {
+        endMs = std::max(startMs + 300, items[index + 1].startMs - 1);
+    }
+    return endMs;
+}
+
+bool IsVideoExtension(const std::wstring& extension) {
+    static const std::set<std::wstring> videoExts = {
+        L".mp4", L".mkv", L".avi", L".mov", L".wmv", L".m4v", L".ts", L".m2ts", L".webm", L".mpg", L".mpeg"
+    };
+    return videoExts.find(ToLowerW(extension)) != videoExts.end();
+}
+
+std::wstring NormalizeNameForMatch(const std::wstring& value) {
+    std::wstring lowered = ToLowerW(value);
+    return std::regex_replace(lowered, std::wregex(LR"([^0-9a-z]+)"), L" ");
+}
+
+std::vector<std::wstring> ExtractMeaningfulTokens(const std::wstring& stem) {
+    static const std::set<std::wstring> noise = {
+        L"1080p", L"2160p", L"720p", L"480p", L"x264", L"x265", L"h264", L"h265", L"hevc", L"av1",
+        L"webrip", L"web", L"webdl", L"bluray", L"brrip", L"dvdrip", L"hdr", L"uhd", L"10bit", L"8bit",
+        L"aac", L"dts", L"truehd", L"atmos", L"proper", L"repack", L"remux", L"yts", L"rarbg"
+    };
+
+    std::wstring normalized = NormalizeNameForMatch(stem);
+    std::wstringstream in(normalized);
+    std::wstring token;
+    std::vector<std::wstring> out;
+
+    while (in >> token) {
+        if (token.size() <= 1) {
+            continue;
+        }
+        if (noise.find(token) != noise.end()) {
+            continue;
+        }
+        out.push_back(token);
+    }
+    return out;
+}
+
+int ExtractYear(const std::wstring& stem) {
+    std::wsmatch match;
+    std::wstring normalized = NormalizeNameForMatch(stem);
+    if (std::regex_search(normalized, match, std::wregex(LR"((19\d{2}|20\d{2}))"))) {
+        return std::stoi(match[1].str());
+    }
+    return -1;
+}
+
+int ExtractEpisode(const std::wstring& stem) {
+    std::wstring normalized = NormalizeNameForMatch(stem);
+    std::wsmatch match;
+
+    if (std::regex_search(normalized, match, std::wregex(LR"(\bs\d{1,2}\s*e\s*(\d{1,3})\b)"))) {
+        return std::stoi(match[1].str());
+    }
+    if (std::regex_search(normalized, match, std::wregex(LR"(\bep\s*(\d{1,3})\b)"))) {
+        return std::stoi(match[1].str());
+    }
+    if (std::regex_search(normalized, match, std::wregex(LR"(\be\s*(\d{1,3})\b)"))) {
+        return std::stoi(match[1].str());
+    }
+    return -1;
+}
+
+int ComputeNameScore(const fs::path& subtitlePath, const fs::path& videoPath) {
+    std::wstring subStem = ToLowerW(subtitlePath.stem().wstring());
+    std::wstring vidStem = ToLowerW(videoPath.stem().wstring());
+    if (subStem == vidStem) {
+        return 1000;
+    }
+
+    int score = 0;
+
+    int subYear = ExtractYear(subtitlePath.stem().wstring());
+    int vidYear = ExtractYear(videoPath.stem().wstring());
+    if (subYear > 0 && vidYear > 0) {
+        score += (subYear == vidYear) ? 120 : -80;
+    }
+
+    int subEp = ExtractEpisode(subtitlePath.stem().wstring());
+    int vidEp = ExtractEpisode(videoPath.stem().wstring());
+    if (subEp > 0 && vidEp > 0) {
+        score += (subEp == vidEp) ? 180 : -120;
+    }
+
+    std::set<std::wstring> subTokens;
+    for (const auto& token : ExtractMeaningfulTokens(subtitlePath.stem().wstring())) {
+        subTokens.insert(token);
+    }
+
+    std::set<std::wstring> vidTokens;
+    for (const auto& token : ExtractMeaningfulTokens(videoPath.stem().wstring())) {
+        vidTokens.insert(token);
+    }
+
+    int overlap = 0;
+    for (const auto& token : subTokens) {
+        if (vidTokens.find(token) != vidTokens.end()) {
+            ++overlap;
+        }
+    }
+    score += overlap * 12;
+
+    if (overlap == 0 && subYear < 0 && subEp < 0) {
+        score -= 30;
+    }
+
+    return score;
+}
+
+std::wstring ResolveMatchedVideoStem(const fs::path& subtitlePath) {
+    std::vector<fs::path> videos;
+    try {
+        for (const auto& entry : fs::directory_iterator(subtitlePath.parent_path())) {
+            if (!entry.is_regular_file()) {
+                continue;
+            }
+            fs::path candidate = entry.path();
+            if (IsVideoExtension(candidate.extension())) {
+                videos.push_back(candidate);
+            }
+        }
+    } catch (...) {
+        return subtitlePath.stem().wstring();
+    }
+
+    if (videos.empty()) {
+        return subtitlePath.stem().wstring();
+    }
+    if (videos.size() == 1) {
+        return videos[0].stem().wstring();
+    }
+
+    int bestScore = -999999;
+    int secondScore = -999999;
+    fs::path bestPath;
+
+    for (const auto& video : videos) {
+        int score = ComputeNameScore(subtitlePath, video);
+        if (score > bestScore) {
+            secondScore = bestScore;
+            bestScore = score;
+            bestPath = video;
+        } else if (score > secondScore) {
+            secondScore = score;
+        }
+    }
+
+    if (bestScore >= 24 && (bestScore - secondScore >= 12 || secondScore < 0)) {
+        return bestPath.stem().wstring();
+    }
+
+    return subtitlePath.stem().wstring();
+}
+
+std::string GuessLangFromClass(const std::wstring& cls) {
+    std::wstring l = ToLowerW(cls);
+    if (l.find(L"kr") != std::wstring::npos || l.find(L"ko") != std::wstring::npos || l.find(L"kor") != std::wstring::npos) {
+        return "ko";
+    }
+    if (l.find(L"en") != std::wstring::npos || l.find(L"eng") != std::wstring::npos) {
+        return "en";
+    }
+    if (l.find(L"jp") != std::wstring::npos || l.find(L"ja") != std::wstring::npos || l.find(L"jpn") != std::wstring::npos) {
+        return "jp";
+    }
+    return "";
+}
+
+std::string GuessLangFromText(const std::wstring& text) {
+    int ko = 0;
+    int en = 0;
+    int jp = 0;
+
+    for (wchar_t ch : text) {
+        if (ch >= 0xAC00 && ch <= 0xD7A3) {
+            ++ko;
+        } else if ((ch >= L'a' && ch <= L'z') || (ch >= L'A' && ch <= L'Z')) {
+            ++en;
+        } else if ((ch >= 0x3040 && ch <= 0x30FF) || (ch >= 0x31F0 && ch <= 0x31FF)) {
+            ++jp;
+        }
+    }
+
+    if (ko >= en && ko >= jp && ko > 0) {
+        return "ko";
+    }
+    if (en >= ko && en >= jp && en > 0) {
+        return "en";
+    }
+    if (jp >= ko && jp >= en && jp > 0) {
+        return "jp";
+    }
+    return "und";
+}
+
+std::wstring FormatTimestamp(int totalMs) {
+    if (totalMs < 0) {
+        totalMs = 0;
+    }
+
+    int hours = totalMs / 2400000;
+    totalMs %= 2400000;
+    int minutes = totalMs / 60000;
+    totalMs %= 60000;
+    int seconds = totalMs / 1000;
+    int millis = totalMs % 1000;
+
+    wchar_t buffer[32] = {};
+    swprintf_s(buffer, L"%02d:%02d:%02d,%03d", hours, minutes, seconds, millis);
+    return buffer;
+}
+
+std::vector<Caption> ParseSmiCaptions(const std::wstring& content) {
+    std::vector<Caption> parsed;
+
+    std::wregex syncRegex(LR"(<sync[^>]*start\s*=\s*(\d+)[^>]*>)", std::regex_constants::icase);
+    std::wsregex_iterator begin(content.begin(), content.end(), syncRegex);
+    std::wsregex_iterator end;
+
+    std::vector<std::pair<size_t, int>> syncPoints;
+    for (auto it = begin; it != end; ++it) {
+        int startMs = std::stoi((*it)[1].str());
+        size_t tagPos = static_cast<size_t>((*it).position()) + (*it).length();
+        syncPoints.push_back({tagPos, startMs});
+    }
+
+    for (size_t i = 0; i < syncPoints.size(); ++i) {
+        size_t startPos = syncPoints[i].first;
+        size_t endPos = (i + 1 < syncPoints.size()) ? syncPoints[i + 1].first : content.size();
+        std::wstring block = content.substr(startPos, endPos - startPos);
+        int startMs = syncPoints[i].second;
+        int inferredEndMs = -1;
+        if (i + 1 < syncPoints.size()) {
+            int nextStartMs = syncPoints[i + 1].second;
+            inferredEndMs = (nextStartMs > startMs) ? (nextStartMs - 1) : (startMs + 300);
+        }
+
+        std::wregex pRegex(LR"(<p[^>]*class\s*=\s*["']?([^"'\s>]+)[^>]*>([\s\S]*?)(?=(<p[^>]*>|$)))", std::regex_constants::icase);
+        std::wsregex_iterator pBegin(block.begin(), block.end(), pRegex);
+        std::wsregex_iterator pEnd;
+
+        bool addedAny = false;
+        for (auto pit = pBegin; pit != pEnd; ++pit) {
+            std::wstring cls = (*pit)[1].str();
+            std::wstring innerHtml = (*pit)[2].str();
+            std::wstring text = NormalizeSubtitleText(innerHtml);
+            if (text.empty()) {
+                continue;
+            }
+            std::string lang = GuessLangFromClass(cls);
+            if (lang.empty()) {
+                lang = GuessLangFromText(text);
+            }
+
+            parsed.push_back({startMs, inferredEndMs, text, innerHtml, lang});
+            addedAny = true;
+        }
+
+        if (!addedAny) {
+            std::wstring text = NormalizeSubtitleText(block);
+            if (!text.empty()) {
+                parsed.push_back({startMs, inferredEndMs, text, block, GuessLangFromText(text)});
+            }
+        }
+    }
+
+    std::sort(parsed.begin(), parsed.end(), [](const Caption& left, const Caption& right) {
+        return left.startMs < right.startMs;
+    });
+
+    return parsed;
+}
+
+std::vector<Caption> ParseSrtCaptions(const std::wstring& content) {
+    std::vector<Caption> parsed;
+
+    std::wregex blockRegex(
+        LR"((?:^|\r?\n)\s*\d+\s*\r?\n\s*(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})\s*\r?\n([\s\S]*?)(?=\r?\n\s*\r?\n|$))",
+        std::regex_constants::icase);
+
+    std::wsregex_iterator begin(content.begin(), content.end(), blockRegex);
+    std::wsregex_iterator end;
+
+    for (auto it = begin; it != end; ++it) {
+        int startMs = ParseSrtTimestamp(Trim((*it)[1].str()));
+        int endMs = ParseSrtTimestamp(Trim((*it)[2].str()));
+        std::wstring text = NormalizePlainSubtitleText((*it)[3].str());
+        if (startMs < 0 || endMs <= startMs || text.empty()) {
+            continue;
+        }
+        parsed.push_back({startMs, endMs, text, L"", GuessLangFromText(text)});
+    }
+
+    std::sort(parsed.begin(), parsed.end(), [](const Caption& left, const Caption& right) {
+        return left.startMs < right.startMs;
+    });
+    return parsed;
+}
+
+std::vector<Caption> ParseAssCaptions(const std::wstring& content) {
+    std::vector<Caption> parsed;
+    std::wstringstream lines(content);
+    std::wstring line;
+
+    bool inEvents = false;
+    std::vector<std::wstring> formatFields;
+
+    while (std::getline(lines, line)) {
+        if (!line.empty() && line.back() == L'\r') {
+            line.pop_back();
+        }
+
+        std::wstring lowered = ToLowerW(Trim(line));
+        if (lowered == L"[events]") {
+            inEvents = true;
+            continue;
+        }
+        if (!inEvents) {
+            continue;
+        }
+        if (!lowered.empty() && lowered.front() == L'[') {
+            break;
+        }
+
+        if (lowered.rfind(L"format:", 0) == 0) {
+            std::wstring fieldSpec = Trim(line.substr(7));
+            formatFields = SplitAssCsv(fieldSpec, 64);
+            for (auto& field : formatFields) {
+                field = ToLowerW(Trim(field));
+            }
+            continue;
+        }
+
+        if (lowered.rfind(L"dialogue:", 0) != 0) {
+            continue;
+        }
+
+        std::wstring payload = line.substr(9);
+        size_t expected = formatFields.empty() ? 10 : formatFields.size();
+        std::vector<std::wstring> fields = SplitAssCsv(payload, expected);
+        if (fields.size() < expected || expected == 0) {
+            continue;
+        }
+
+        int startIdx = -1;
+        int endIdx = -1;
+        int textIdx = -1;
+
+        if (formatFields.empty()) {
+            startIdx = 1;
+            endIdx = 2;
+            textIdx = 9;
+        } else {
+            for (size_t i = 0; i < formatFields.size(); ++i) {
+                if (formatFields[i] == L"start") startIdx = static_cast<int>(i);
+                if (formatFields[i] == L"end") endIdx = static_cast<int>(i);
+                if (formatFields[i] == L"text") textIdx = static_cast<int>(i);
+            }
+        }
+
+        if (startIdx < 0 || endIdx < 0 || textIdx < 0 ||
+            static_cast<size_t>(std::max({startIdx, endIdx, textIdx})) >= fields.size()) {
+            continue;
+        }
+
+        int startMs = ParseAssTimestamp(Trim(fields[static_cast<size_t>(startIdx)]));
+        int endMs = ParseAssTimestamp(Trim(fields[static_cast<size_t>(endIdx)]));
+        std::wstring text = StripAssOverrides(fields[static_cast<size_t>(textIdx)]);
+        if (startMs < 0 || endMs <= startMs || text.empty()) {
+            continue;
+        }
+
+        parsed.push_back({startMs, endMs, text, L"", GuessLangFromText(text)});
+    }
+
+    std::sort(parsed.begin(), parsed.end(), [](const Caption& left, const Caption& right) {
+        return left.startMs < right.startMs;
+    });
+    return parsed;
+}
+
+TargetFormat ParseTargetFormatOrDefault(const std::wstring& arg, bool* matched) {
+    std::wstring lower = ToLowerW(arg);
+    if (lower == L"/to:smi" || lower == L"--to=smi" || lower == L"-to:smi") {
+        if (matched) *matched = true;
+        return TargetFormat::ToSmi;
+    }
+    if (lower == L"/to:srt" || lower == L"--to=srt" || lower == L"-to:srt") {
+        if (matched) *matched = true;
+        return TargetFormat::ToSrt;
+    }
+    if (lower == L"/to:ass" || lower == L"--to=ass" || lower == L"-to:ass") {
+        if (matched) *matched = true;
+        return TargetFormat::ToAss;
+    }
+    if (matched) *matched = false;
+    return TargetFormat::ToSrt;
+}
+
+std::vector<Caption> ParseCaptionsByExtension(const std::wstring& extension, const std::wstring& content) {
+    std::wstring ext = ToLowerW(extension);
+    if (ext == L".smi") {
+        return ParseSmiCaptions(content);
+    }
+    if (ext == L".srt") {
+        return ParseSrtCaptions(content);
+    }
+    if (ext == L".ass") {
+        return ParseAssCaptions(content);
+    }
+    return {};
+}
+
+std::wstring BuildSrtText(const std::vector<Caption>& items) {
+    std::wstring srt;
+    int index = 1;
+    for (size_t i = 0; i < items.size(); ++i) {
+        int startMs = std::max(0, items[i].startMs);
+        int endMs = ResolveCaptionEndMs(items, i);
+        srt += std::to_wstring(index++);
+        srt += L"\r\n";
+        srt += FormatTimestamp(startMs) + L" --> " + FormatTimestamp(endMs) + L"\r\n";
+        srt += items[i].text + L"\r\n\r\n";
+    }
+    return srt;
+}
+
+std::wstring BuildSmiText(const std::vector<Caption>& items) {
+    std::wstring smi = L"<SAMI>\r\n<BODY>\r\n";
+    for (size_t i = 0; i < items.size(); ++i) {
+        int startMs = std::max(0, items[i].startMs);
+        smi += L"<SYNC Start=" + std::to_wstring(startMs) + L"><P Class=KRCC>" + ToSmiText(items[i].text) + L"\r\n";
+    }
+    smi += L"</BODY>\r\n</SAMI>\r\n";
+    return smi;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ASS style optimisation helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+static constexpr int kAssDefaultFontSize = 50;
+
+// Represents the set of formatting properties that can be expressed as a
+// named [V4+ Styles] entry.
+struct StyleDef {
+    std::wstring color;   // ASS inline format  &HBBGGRR&  (empty = default white)
+    bool bold      = false;
+    bool italic    = false;
+    bool underline = false;
+    bool strikeout = false;
+    int  fontSize  = 0;   // 0 = inherit default
+
+    bool IsDefault() const {
+        return color.empty() && !bold && !italic && !underline && !strikeout && fontSize == 0;
+    }
+    bool operator==(const StyleDef& o) const {
+        return color == o.color && bold == o.bold && italic == o.italic &&
+               underline == o.underline && strikeout == o.strikeout && fontSize == o.fontSize;
+    }
+    bool operator<(const StyleDef& o) const {
+        if (color != o.color) return color < o.color;
+        if (bold != o.bold)   return static_cast<int>(bold) < static_cast<int>(o.bold);
+        if (italic != o.italic) return static_cast<int>(italic) < static_cast<int>(o.italic);
+        if (underline != o.underline) return static_cast<int>(underline) < static_cast<int>(o.underline);
+        if (strikeout != o.strikeout) return static_cast<int>(strikeout) < static_cast<int>(o.strikeout);
+        return fontSize < o.fontSize;
+    }
+};
+
+// Render a StyleDef back to ASS inline override codes (used when the style
+// is not declared as a named style).
+std::wstring StyleDefToInlineCodes(const StyleDef& s) {
+    std::wstring codes;
+    if (s.bold)      codes += L"{\\b1}";
+    if (s.italic)    codes += L"{\\i1}";
+    if (s.underline) codes += L"{\\u1}";
+    if (s.strikeout) codes += L"{\\s1}";
+    if (!s.color.empty())  codes += L"{\\c" + s.color + L"}";
+    if (s.fontSize > 0)    codes += L"{\\fs" + std::to_wstring(s.fontSize) + L"}";
+    return codes;
+}
+
+// Build the [V4+ Styles] "Style: ..." line for a named style.
+std::wstring StyleDefToAssStyleLine(const std::wstring& name, const StyleDef& s) {
+    int fontSize = (s.fontSize > 0) ? s.fontSize : kAssDefaultFontSize;
+
+    // s.color is &HBBGGRR& (9 chars); style field needs &H00BBGGRR (10 chars).
+    std::wstring primaryColor = L"&H00FFFFFF";
+    if (!s.color.empty() && s.color.size() >= 9) {
+        primaryColor = L"&H00" + s.color.substr(2, 6); // skip &H, take 6 hex digits
+    }
+
+    return L"Style: " + name +
+           L",Arial," + std::to_wstring(fontSize) + L"," +
+           primaryColor + L",&H000000FF,&H00000000,&H64000000," +
+           (s.bold      ? L"1" : L"0") + L"," +
+           (s.italic    ? L"1" : L"0") + L"," +
+           (s.underline ? L"1" : L"0") + L"," +
+           (s.strikeout ? L"1" : L"0") + L"," +
+           L"100,100,0,0,1,2,1,2,20,20,20,0\r\n";
+}
+
+// Derive a human-readable style name from a StyleDef.
+// Colors are expressed as RGB hex (e.g. Clr_87CEEB for skyblue).
+std::wstring StyleDefToName(const StyleDef& s) {
+    std::vector<std::wstring> parts;
+
+    if (!s.color.empty() && s.color.size() >= 9) {
+        // s.color = &HBBGGRR& → convert to RGB order for readability
+        try {
+            int b = std::stoi(s.color.substr(2, 2), nullptr, 16);
+            int g = std::stoi(s.color.substr(4, 2), nullptr, 16);
+            int r = std::stoi(s.color.substr(6, 2), nullptr, 16);
+            wchar_t buf[16];
+            swprintf_s(buf, L"Clr_%02X%02X%02X", r, g, b);
+            parts.push_back(buf);
+        } catch (...) {
+            parts.push_back(L"Color");
+        }
+    }
+    if (s.bold)      parts.push_back(L"Bold");
+    if (s.italic)    parts.push_back(L"Italic");
+    if (s.underline) parts.push_back(L"Underline");
+    if (s.strikeout) parts.push_back(L"Strikeout");
+    if (s.fontSize > 0) parts.push_back(L"Fs" + std::to_wstring(s.fontSize));
+
+    std::wstring name;
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (i > 0) name += L"_";
+        name += parts[i];
+    }
+    return name.empty() ? L"Custom" : name;
+}
+
+// Strip ASS override blocks at the END of a dialogue text that merely reset
+// formatting to defaults.  Because each ASS Dialogue event resets style to
+// its named style automatically, these trailing resets are redundant.
+std::wstring StripTrailingAssResets(const std::wstring& text) {
+    const std::wstring fsReset = L"{\\fs" + std::to_wstring(kAssDefaultFontSize) + L"}";
+
+    std::wstring out = text;
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        if (out.empty() || out.back() != L'}') break;
+        size_t open = out.rfind(L'{');
+        if (open == std::wstring::npos) break;
+        std::wstring last = out.substr(open);
+
+        bool isReset = (last == L"{\\b0}" || last == L"{\\i0}" ||
+                        last == L"{\\u0}" || last == L"{\\s0}" ||
+                        last == L"{\\c&H00FFFFFF&}" || last == fsReset);
+        if (isReset) {
+            out = out.substr(0, open);
+            changed = true;
+        }
+    }
+    return out;
+}
+
+// Remove redundant reset/reopen pairs across \N and override blocks with
+// no intervening visible text.  Examples:
+//   {\c&H00FFFFFF&}\N{\i1}{\c&HEBCE87&}  →  \N{\i1}{\c&HEBCE87&}
+//   {\i0}\N{\i1}                         →  \N{\i1}
+// Applied iteratively until stable.
+std::wstring OptimizeAssInlineCodes(std::wstring text) {
+    // (?:\N|\{[^}]*\})* matches sequences of line-break or any override block
+    static const std::wregex colorReset(
+        LR"(\{\\c&H00FFFFFF&\}((?:\\N|\{[^}]*\})*)(\{\\c[^}]+\}))",
+        std::regex_constants::icase);
+    static const std::wregex italicReset(
+        LR"(\{\\i0\}((?:\\N|\{[^}]*\})*)(\{\\i1\}))");
+    static const std::wregex boldReset(
+        LR"(\{\\b0\}((?:\\N|\{[^}]*\})*)(\{\\b1\}))");
+    static const std::wregex underlineReset(
+        LR"(\{\\u0\}((?:\\N|\{[^}]*\})*)(\{\\u1\}))");
+    static const std::wregex strikeReset(
+        LR"(\{\\s0\}((?:\\N|\{[^}]*\})*)(\{\\s1\}))");
+    static const std::wregex fsReset(
+        std::wstring(LR"(\{\\fs)") + std::to_wstring(kAssDefaultFontSize) +
+        LR"(\}((?:\\N|\{[^}]*\})*)(\{\\fs\d+\}))");
+
+    const std::wregex* patterns[] = {
+        &colorReset, &italicReset, &boldReset, &underlineReset, &strikeReset, &fsReset
+    };
+
+    bool changed;
+    do {
+        changed = false;
+        for (const auto* re : patterns) {
+            std::wstring next = std::regex_replace(text, *re, L"$1$2");
+            if (next != text) { text = std::move(next); changed = true; }
+        }
+    } while (changed);
+
+    return text;
+}
+
+bool ApplyAssOverrideToStyle(const std::wstring& inner, StyleDef& style) {
+    if (inner == L"\\b1") {
+        style.bold = true;
+        return true;
+    }
+    if (inner == L"\\b0") {
+        style.bold = false;
+        return true;
+    }
+    if (inner == L"\\i1") {
+        style.italic = true;
+        return true;
+    }
+    if (inner == L"\\i0") {
+        style.italic = false;
+        return true;
+    }
+    if (inner == L"\\u1") {
+        style.underline = true;
+        return true;
+    }
+    if (inner == L"\\u0") {
+        style.underline = false;
+        return true;
+    }
+    if (inner == L"\\s1") {
+        style.strikeout = true;
+        return true;
+    }
+    if (inner == L"\\s0") {
+        style.strikeout = false;
+        return true;
+    }
+    if (inner == L"\\r" || inner == L"\\rDefault") {
+        style = StyleDef{};
+        return true;
+    }
+    if (inner.rfind(L"\\c", 0) == 0 && inner.size() > 2) {
+        std::wstring color = inner.substr(2);
+        if (ToLowerW(color) == L"&h00ffffff&") {
+            style.color.clear();
+        } else {
+            style.color = color;
+        }
+        return true;
+    }
+    if (inner.rfind(L"\\fs", 0) == 0 && inner.size() > 3) {
+        try {
+            int fontSize = std::stoi(inner.substr(3));
+            style.fontSize = (fontSize == kAssDefaultFontSize) ? 0 : fontSize;
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+    return false;
+}
+
+bool HasVisibleTextBeforeNextOverride(const std::wstring& text, size_t pos) {
+    while (pos < text.size()) {
+        if (text[pos] == L'{') {
+            return false;
+        }
+        if (text[pos] == L'\\' && pos + 1 < text.size() && text[pos + 1] == L'N') {
+            pos += 2;
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
+void CollectStyleRunsFromAssText(const std::wstring& text, std::map<StyleDef, int>& styleCounts) {
+    StyleDef currentStyle;
+    size_t pos = 0;
+
+    while (pos < text.size()) {
+        if (text[pos] != L'{') {
+            if (text[pos] == L'\\' && pos + 1 < text.size() && text[pos + 1] == L'N') {
+                pos += 2;
+            } else {
+                ++pos;
+            }
+            continue;
+        }
+
+        StyleDef nextStyle = currentStyle;
+        bool recognizedAny = false;
+        bool allRecognized = true;
+
+        while (pos < text.size() && text[pos] == L'{') {
+            size_t close = text.find(L'}', pos);
+            if (close == std::wstring::npos) {
+                allRecognized = false;
+                pos = text.size();
+                break;
+            }
+
+            std::wstring inner = text.substr(pos + 1, close - pos - 1);
+            if (ApplyAssOverrideToStyle(inner, nextStyle)) {
+                recognizedAny = true;
+            } else {
+                allRecognized = false;
+            }
+            pos = close + 1;
+        }
+
+        if (allRecognized && recognizedAny && !(nextStyle == currentStyle) &&
+            !nextStyle.IsDefault() && HasVisibleTextBeforeNextOverride(text, pos)) {
+            ++styleCounts[nextStyle];
+        }
+
+        if (allRecognized && recognizedAny) {
+            currentStyle = nextStyle;
+        }
+    }
+}
+
+std::wstring RewriteAssTextWithNamedStyles(
+    const std::wstring& text,
+    const std::map<StyleDef, std::wstring>& styleNames) {
+
+    std::wstring out;
+    out.reserve(text.size());
+
+    StyleDef currentStyle;
+    size_t pos = 0;
+
+    while (pos < text.size()) {
+        if (text[pos] != L'{') {
+            if (text[pos] == L'\\' && pos + 1 < text.size() && text[pos + 1] == L'N') {
+                out += L"\\N";
+                pos += 2;
+            } else {
+                out.push_back(text[pos]);
+                ++pos;
+            }
+            continue;
+        }
+
+        StyleDef nextStyle = currentStyle;
+        std::wstring rawBlocks;
+        bool recognizedAny = false;
+        bool allRecognized = true;
+
+        while (pos < text.size() && text[pos] == L'{') {
+            size_t close = text.find(L'}', pos);
+            if (close == std::wstring::npos) {
+                allRecognized = false;
+                rawBlocks += text.substr(pos);
+                pos = text.size();
+                break;
+            }
+
+            rawBlocks += text.substr(pos, close - pos + 1);
+            std::wstring inner = text.substr(pos + 1, close - pos - 1);
+            if (ApplyAssOverrideToStyle(inner, nextStyle)) {
+                recognizedAny = true;
+            } else {
+                allRecognized = false;
+            }
+            pos = close + 1;
+        }
+
+        bool hasVisibleText = HasVisibleTextBeforeNextOverride(text, pos);
+        if (allRecognized && recognizedAny) {
+            if (!(nextStyle == currentStyle) && hasVisibleText) {
+                if (nextStyle.IsDefault()) {
+                    out += L"{\\rDefault}";
+                } else {
+                    auto it = styleNames.find(nextStyle);
+                    if (it != styleNames.end()) {
+                        out += L"{\\r" + it->second + L"}";
+                    } else {
+                        out += rawBlocks;
+                    }
+                }
+            }
+            currentStyle = nextStyle;
+        } else {
+            out += rawBlocks;
+        }
+    }
+
+    return out;
+}
+
+// Try to detect a "uniform style": the ASS text begins with a sequence of
+// opening override codes and the rest of the content (which may contain \N
+// line-breaks) carries no further override codes.  If successful, the
+// extracted StyleDef is placed in |outStyle| and the bare text is placed
+// in |outStripped|.
+bool TryExtractUniformStyle(const std::wstring& text,
+                             StyleDef& outStyle, std::wstring& outStripped) {
+    StyleDef s;
+    size_t pos = 0;
+
+    while (pos < text.size() && text[pos] == L'{') {
+        size_t close = text.find(L'}', pos);
+        if (close == std::wstring::npos) break;
+        std::wstring inner = text.substr(pos + 1, close - pos - 1);
+
+        if (inner == L"\\b1") {
+            s.bold = true;
+        } else if (inner == L"\\i1") {
+            s.italic = true;
+        } else if (inner == L"\\u1") {
+            s.underline = true;
+        } else if (inner == L"\\s1") {
+            s.strikeout = true;
+        } else if (inner.rfind(L"\\c", 0) == 0 && inner.size() > 2) {
+            s.color = inner.substr(2); // &HBBGGRR&  (skip \c prefix)
+        } else if (inner.rfind(L"\\fs", 0) == 0) {
+            try { s.fontSize = std::stoi(inner.substr(3)); } catch (...) {}
+        } else {
+            return false; // unknown override — can't convert to named style
+        }
+        pos = close + 1;
+    }
+
+    if (s.IsDefault()) return false; // nothing to extract
+
+    std::wstring remaining = text.substr(pos);
+    if (remaining.empty()) return false;
+    if (remaining.find(L'{') != std::wstring::npos) return false; // mixed formatting
+
+    outStyle   = s;
+    outStripped = remaining;
+    return true;
+}
+
+std::wstring BuildAssText(const std::vector<Caption>& items) {
+    // ── Pass 1: generate per-item ASS text and detect uniform styles ──────────
+    struct ItemInfo {
+        std::wstring assText;      // dialogue text after local optimization
+        StyleDef     style;        // uniform style, if detected
+        bool         hasUniform;   // true  → assText has no inline codes
+    };
+
+    std::vector<ItemInfo> infos;
+    infos.reserve(items.size());
+
+    std::map<StyleDef, int> styleCounts;
+
+    for (const auto& item : items) {
+        ItemInfo info{};
+        std::wstring raw;
+
+        if (!item.rawHtml.empty()) {
+            raw = SmiHtmlToAssText(item.rawHtml);
+        } else {
+            raw = item.text;
+            size_t p = 0;
+            while ((p = raw.find(L"\n", p)) != std::wstring::npos) {
+                raw.replace(p, 1, L"\\N");
+                p += 2;
+            }
+        }
+
+        raw = StripTrailingAssResets(raw);
+        raw = OptimizeAssInlineCodes(raw);
+        CollectStyleRunsFromAssText(raw, styleCounts);
+
+        StyleDef s;
+        std::wstring stripped;
+        if (TryExtractUniformStyle(raw, s, stripped)) {
+            info.style      = s;
+            info.assText    = stripped;
+            info.hasUniform = true;
+        } else {
+            info.assText    = raw;
+            info.hasUniform = false;
+        }
+
+        infos.push_back(std::move(info));
+    }
+
+    // ── Pass 2: declare named styles for those used ≥ 2 times ────────────────
+    // Sort by occurrence count descending so the most common style comes first.
+    std::vector<std::pair<int, StyleDef>> ranked;
+    ranked.reserve(styleCounts.size());
+    for (const auto& [s, cnt] : styleCounts) {
+        if (cnt >= 2) ranked.push_back({cnt, s});
+    }
+    std::sort(ranked.begin(), ranked.end(),
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+
+    std::map<StyleDef, std::wstring> styleNames;
+    std::set<std::wstring> usedNames;
+    usedNames.insert(L"Default");
+
+    for (const auto& [cnt, s] : ranked) {
+        std::wstring name = StyleDefToName(s);
+        if (usedNames.count(name)) {
+            int n = 2;
+            while (usedNames.count(name + L"_" + std::to_wstring(n))) ++n;
+            name += L"_" + std::to_wstring(n);
+        }
+        usedNames.insert(name);
+        styleNames[s] = name;
+    }
+
+    // ── Build output ──────────────────────────────────────────────────────────
+    std::wstring ass;
+    ass += L"[Script Info]\r\n";
+    ass += L"Title: subConverter\r\n";
+    ass += L"ScriptType: v4.00+\r\n";
+    ass += L"PlayResX: 1280\r\n";
+    ass += L"PlayResY: 720\r\n";
+    ass += L"WrapStyle: 0\r\n";
+    ass += L"ScaledBorderAndShadow: yes\r\n\r\n";
+    ass += L"[V4+ Styles]\r\n";
+    ass += L"Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\r\n";
+    ass += L"Style: Default,Arial,24,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,2,1,2,20,20,20,0\r\n";
+
+    // Named styles sorted alphabetically for deterministic output
+    std::vector<std::pair<std::wstring, StyleDef>> sortedStyles;
+    sortedStyles.reserve(styleNames.size());
+    for (const auto& [s, name] : styleNames) sortedStyles.push_back({name, s});
+    std::sort(sortedStyles.begin(), sortedStyles.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    for (const auto& [name, s] : sortedStyles) {
+        ass += StyleDefToAssStyleLine(name, s);
+    }
+
+    ass += L"\r\n[Events]\r\n";
+    ass += L"Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\r\n";
+
+    for (size_t i = 0; i < items.size(); ++i) {
+        int startMs = std::max(0, items[i].startMs);
+        int endMs   = ResolveCaptionEndMs(items, i);
+
+        std::wstring styleName = L"Default";
+        std::wstring text      = infos[i].assText;
+
+        if (infos[i].hasUniform) {
+            auto it = styleNames.find(infos[i].style);
+            if (it != styleNames.end()) {
+                // Use the declared named style — no inline codes needed
+                styleName = it->second;
+            } else {
+                // Style used only once — keep inline codes, text is already stripped
+                text = StyleDefToInlineCodes(infos[i].style) + text;
+            }
+        } else {
+            text = RewriteAssTextWithNamedStyles(text, styleNames);
+        }
+
+        ass += L"Dialogue: 0," + FormatTimestampAss(startMs) + L"," + FormatTimestampAss(endMs) +
+               L"," + styleName + L",,,,,," + text + L"\r\n";
+    }
+    return ass;
+}
+
+std::wstring TargetExtension(TargetFormat target) {
+    if (target == TargetFormat::ToSmi) return L".smi";
+    if (target == TargetFormat::ToAss) return L".ass";
+    return L".srt";
+}
+
+std::wstring BuildOutputText(TargetFormat target, const std::vector<Caption>& items) {
+    if (target == TargetFormat::ToSmi) {
+        return BuildSmiText(items);
+    }
+    if (target == TargetFormat::ToAss) {
+        return BuildAssText(items);
+    }
+    return BuildSrtText(items);
+}
+
+fs::path EnsureUniqueOutputPath(const fs::path& candidate) {
+    std::error_code ec;
+    if (!fs::exists(candidate, ec)) {
+        return candidate;
+    }
+
+    fs::path parent = candidate.parent_path();
+    std::wstring stem = candidate.stem().wstring();
+    std::wstring ext = candidate.extension().wstring();
+
+    for (int n = 1; n < 100000; ++n) {
+        fs::path next = parent / (stem + L" (" + std::to_wstring(n) + L")" + ext);
+        std::error_code existsEc;
+        if (!fs::exists(next, existsEc)) {
+            return next;
+        }
+    }
+
+    return candidate;
+}
+
+bool WriteUtf8File(const fs::path& outPath, const std::wstring& content) {
+    int needed = WideCharToMultiByte(CP_UTF8, 0, content.c_str(), static_cast<int>(content.size()), nullptr, 0, nullptr, nullptr);
+    if (needed <= 0) {
+        return false;
+    }
+
+    std::string utf8(static_cast<size_t>(needed), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, content.c_str(), static_cast<int>(content.size()), utf8.data(), needed, nullptr, nullptr);
+
+    std::wstring rawPath = outPath.wstring();
+    std::wstring ioPath = rawPath;
+    if (ioPath.rfind(L"\\\\?\\", 0) != 0) {
+        if (ioPath.rfind(L"\\\\", 0) == 0) {
+            ioPath = L"\\\\?\\UNC\\" + ioPath.substr(2);
+        } else if (ioPath.size() >= 248) {
+            ioPath = L"\\\\?\\" + ioPath;
+        }
+    }
+
+    HANDLE out = CreateFileW(
+        ioPath.c_str(),
+        GENERIC_WRITE,
+        FILE_SHARE_READ,
+        nullptr,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (out == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    const unsigned char bom[] = {0xEF, 0xBB, 0xBF};
+    DWORD wrote = 0;
+    BOOL bomOk = WriteFile(out, bom, 3, &wrote, nullptr);
+    if (!bomOk || wrote != 3) {
+        CloseHandle(out);
+        return false;
+    }
+
+    size_t writtenTotal = 0;
+    while (writtenTotal < utf8.size()) {
+        DWORD chunk = static_cast<DWORD>(std::min<size_t>(1 << 20, utf8.size() - writtenTotal));
+        DWORD chunkWritten = 0;
+        BOOL ok = WriteFile(out, utf8.data() + writtenTotal, chunk, &chunkWritten, nullptr);
+        if (!ok || chunkWritten == 0) {
+            CloseHandle(out);
+            return false;
+        }
+        writtenTotal += chunkWritten;
+    }
+
+    CloseHandle(out);
+    return true;
+}
+
+ConvertResult ConvertSingleFile(const fs::path& inputPath, TargetFormat target) {
+    std::wstring rawPath = inputPath.wstring();
+    std::wstring ioPath = rawPath;
+    if (ioPath.rfind(L"\\\\?\\", 0) != 0) {
+        if (ioPath.rfind(L"\\\\", 0) == 0) {
+            ioPath = L"\\\\?\\UNC\\" + ioPath.substr(2);
+        } else if (ioPath.size() >= 248) {
+            ioPath = L"\\\\?\\" + ioPath;
+        }
+    }
+
+    HANDLE in = CreateFileW(
+        ioPath.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (in == INVALID_HANDLE_VALUE) {
+        return {false, L"파일을 열 수 없습니다."};
+    }
+
+    LARGE_INTEGER fileSize{};
+    if (!GetFileSizeEx(in, &fileSize) || fileSize.QuadPart < 0) {
+        CloseHandle(in);
+        return {false, L"파일 크기 확인에 실패했습니다."};
+    }
+
+    std::string bytes;
+    bytes.reserve(static_cast<size_t>(std::min<LONGLONG>(fileSize.QuadPart, 16 * 1024 * 1024)));
+
+    char buffer[1 << 20];
+    while (true) {
+        DWORD read = 0;
+        BOOL ok = ReadFile(in, buffer, static_cast<DWORD>(sizeof(buffer)), &read, nullptr);
+        if (!ok) {
+            CloseHandle(in);
+            return {false, L"파일 읽기에 실패했습니다."};
+        }
+        if (read == 0) {
+            break;
+        }
+        bytes.append(buffer, buffer + read);
+    }
+    CloseHandle(in);
+
+    std::wstring content = DecodeToWide(bytes);
+    if (content.empty()) {
+        return {false, L"파일 인코딩을 해석하지 못했습니다."};
+    }
+
+    std::wstring inputExt = ToLowerW(inputPath.extension().wstring());
+    std::vector<Caption> captions = ParseCaptionsByExtension(inputExt, content);
+    if (captions.empty()) {
+        return {false, L"변환 가능한 자막 구간을 찾지 못했습니다."};
+    }
+
+    if (inputExt == L".smi") {
+        RemoveCreditCaptions(captions);
+        if (captions.empty()) {
+            return {false, L"크레딧(제작자 정보) 제거 후 변환 가능한 자막이 없습니다."};
+        }
+    }
+
+    std::map<std::string, std::vector<Caption>> byLang;
+    for (const Caption& caption : captions) {
+        std::string lang = caption.lang.empty() ? "und" : caption.lang;
+        byLang[lang].push_back(caption);
+    }
+
+    std::wstring outputBaseStem = ResolveMatchedVideoStem(inputPath);
+    std::wstring outputExt = TargetExtension(target);
+
+    for (auto& pair : byLang) {
+        auto& items = pair.second;
+        if (items.empty()) {
+            continue;
+        }
+        std::sort(items.begin(), items.end(), [](const Caption& left, const Caption& right) {
+            return left.startMs < right.startMs;
+        });
+
+        std::wstring outText = BuildOutputText(target, items);
+
+        fs::path out = inputPath.parent_path() / outputBaseStem;
+        if (pair.first != "und") {
+            out += L"." + MultiByteToWide(pair.first, CP_UTF8);
+        }
+        out += outputExt;
+        out = EnsureUniqueOutputPath(out);
+
+        if (!WriteUtf8File(out, outText)) {
+            return {false, L"변환 파일 저장에 실패했습니다."};
+        }
+    }
+
+    return {true, L""};
+}
+
+std::wstring JoinFailures(const std::vector<std::wstring>& failed) {
+    std::wstring joined;
+    for (size_t i = 0; i < failed.size(); ++i) {
+        joined += failed[i];
+        if (i + 1 < failed.size()) {
+            joined += L"\n";
+        }
+    }
+    return joined;
+}
+
+void DebugLog(const std::wstring& message) {
+    const char* env = std::getenv("SUBCONVERTER_DEBUG");
+    if (!env || env[0] == '\0') {
+        env = std::getenv("SMI2SRT_DEBUG");
+    }
+    if (!env || env[0] == '\0') {
+        return;
+    }
+
+    wchar_t tmp[MAX_PATH] = {};
+    GetTempPathW(MAX_PATH, tmp);
+    std::wstring path = tmp;
+    if (!path.empty() && path.back() != L'\\') {
+        path += L'\\';
+    }
+    path += L"subConverter_debug.log";
+
+    HANDLE h = CreateFileW(path.c_str(), FILE_APPEND_DATA,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    wchar_t prefix[64] = {};
+    swprintf_s(prefix, L"[%04d-%02d-%02d %02d:%02d:%02d] ",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+
+    std::wstring line = std::wstring(prefix) + message + L"\r\n";
+    DWORD wrote = 0;
+    WriteFile(h, line.data(), static_cast<DWORD>(line.size() * sizeof(wchar_t)), &wrote, nullptr);
+    CloseHandle(h);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Multi-instance file queue
+// Explorer launches one process per file when registered with %1.
+// The first process becomes the "collector": it waits briefly (COLLECT_MS) while
+// the other instances each enqueue their file path into a shared temp directory,
+// then exits immediately.  The collector drains the queue and processes every
+// file in one batch, showing a single summary notification.
+// ─────────────────────────────────────────────────────────────────────────────
+
+static constexpr DWORD COLLECT_MS = 350;
+static const wchar_t* COLLECTOR_MUTEX_NAME = L"Local\\smi2srt_collector";
+static const wchar_t* QUEUE_WRITE_MUTEX_NAME = L"Local\\smi2srt_queue_writer";
+static const wchar_t* QUEUE_FILE_NAME = L"smi2srt_queue.txt";
+
+std::wstring GetQueueFilePath() {
+    wchar_t tmp[MAX_PATH] = {};
+    GetTempPathW(MAX_PATH, tmp);
+    std::wstring path = tmp;
+    if (!path.empty() && path.back() != L'\\') {
+        path += L'\\';
+    }
+    path += QUEUE_FILE_NAME;
+    return path;
+}
+
+void EnqueueFiles(const std::vector<fs::path>& files) {
+    HANDLE writeMutex = CreateMutexW(nullptr, FALSE, QUEUE_WRITE_MUTEX_NAME);
+    if (!writeMutex) {
+        return;
+    }
+
+    WaitForSingleObject(writeMutex, INFINITE);
+
+    std::wstring queuePath = GetQueueFilePath();
+    HANDLE h = CreateFileW(queuePath.c_str(), FILE_APPEND_DATA,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        ReleaseMutex(writeMutex);
+        CloseHandle(writeMutex);
+        return;
+    }
+
+    for (const auto& p : files) {
+        std::wstring line = p.wstring() + L"\n";
+        DWORD wrote = 0;
+        WriteFile(h,
+                  line.data(),
+                  static_cast<DWORD>(line.size() * sizeof(wchar_t)),
+                  &wrote,
+                  nullptr);
+    }
+    CloseHandle(h);
+
+    ReleaseMutex(writeMutex);
+    CloseHandle(writeMutex);
+}
+
+std::vector<fs::path> DrainQueue() {
+    std::wstring queuePath = GetQueueFilePath();
+    std::vector<fs::path> result;
+
+    HANDLE hFile = CreateFileW(queuePath.c_str(), GENERIC_READ,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               nullptr, OPEN_EXISTING,
+                               FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        return result;
+    }
+
+    std::wstring fileText;
+    wchar_t buf[2048];
+    DWORD read = 0;
+    while (ReadFile(hFile, buf, sizeof(buf), &read, nullptr) && read > 0) {
+        size_t chars = static_cast<size_t>(read / sizeof(wchar_t));
+        fileText.append(buf, buf + chars);
+    }
+    CloseHandle(hFile);
+    DeleteFileW(queuePath.c_str());
+
+    std::wstringstream stream(fileText);
+    std::wstring line;
+    while (std::getline(stream, line)) {
+        if (!line.empty() && line.back() == L'\r') { line.pop_back(); }
+        line = Trim(line);
+        if (!line.empty()) {
+            fs::path p(line);
+            if (IsSubtitleExtension(p.extension().wstring())) {
+                result.push_back(p);
+            }
+        }
+    }
+
+    return result;
+}
+
+unsigned int ResolveWorkerCount(size_t fileCount) {
+    if (fileCount <= 1) {
+        return 1;
+    }
+
+    unsigned int hardware = std::thread::hardware_concurrency();
+    if (hardware == 0) {
+        hardware = 4;
+    }
+
+    unsigned int workerCount = std::min<unsigned int>(hardware, static_cast<unsigned int>(fileCount));
+
+    const char* env = std::getenv("SUBCONVERTER_THREADS");
+    if (!env || !*env) {
+        env = std::getenv("SMI2SRT_THREADS");
+    }
+    if (env && *env) {
+        char* parseEnd = nullptr;
+        long custom = std::strtol(env, &parseEnd, 10);
+        if (parseEnd != env && custom > 0) {
+            workerCount = std::min<unsigned int>(
+                static_cast<unsigned int>(custom),
+                static_cast<unsigned int>(fileCount));
+        }
+    }
+
+    return std::max(1u, workerCount);
+}
+
+int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    bool silentMode = false;
+    TargetFormat target = TargetFormat::ToSrt;
+    DebugLog(L"launch argc=" + std::to_wstring(argc));
+
+    if (!argv || argc <= 1) {
+        if (!silentMode) {
+            MessageBoxW(nullptr,
+                L"사용법:\n파일 탐색기에서 .smi/.srt/.ass 파일을 선택하고 subConverter 메뉴에서 변환하세요.",
+                L"subConverter",
+                MB_OK | MB_ICONINFORMATION);
+        }
+        if (argv) {
+            LocalFree(argv);
+        }
+        return 0;
+    }
+
+    std::vector<fs::path> inputFiles;
+    inputFiles.reserve(static_cast<size_t>(argc));
+    int skippedCount = 0;
+
+    for (int i = 1; i < argc; ++i) {
+        DebugLog(L"arg=" + std::wstring(argv[i]));
+        std::wstring arg = ToLowerW(argv[i]);
+        if (arg == L"/silent" || arg == L"-silent" || arg == L"--silent") {
+            silentMode = true;
+            continue;
+        }
+
+        bool isTargetArg = false;
+        TargetFormat parsedTarget = ParseTargetFormatOrDefault(argv[i], &isTargetArg);
+        if (isTargetArg) {
+            target = parsedTarget;
+            continue;
+        }
+
+        fs::path path(argv[i]);
+        if (IsSubtitleExtension(path.extension().wstring())) {
+            inputFiles.push_back(path);
+        } else {
+            ++skippedCount;
+        }
+    }
+
+    if (inputFiles.empty()) {
+        DebugLog(L"inputFiles=0");
+        LocalFree(argv);
+        return 0;
+    }
+
+    // Explorer may launch one process per selected file when command uses %1.
+    // Aggregate those launches into one batch so users get one summary result.
+    HANDLE collectorMutex = CreateMutexW(nullptr, TRUE, COLLECTOR_MUTEX_NAME);
+    if (collectorMutex) {
+        DWORD lastErr = GetLastError();
+        if (lastErr == ERROR_ALREADY_EXISTS) {
+            EnqueueFiles(inputFiles);
+            CloseHandle(collectorMutex);
+            LocalFree(argv);
+            return 0;
+        }
+
+        EnqueueFiles(inputFiles);
+        Sleep(COLLECT_MS);
+        inputFiles = DrainQueue();
+
+        ReleaseMutex(collectorMutex);
+        CloseHandle(collectorMutex);
+
+        if (inputFiles.empty()) {
+            LocalFree(argv);
+            return 0;
+        }
+    }
+
+    DebugLog(L"inputFiles=" + std::to_wstring(inputFiles.size()));
+
+    std::atomic<int> success(0);
+    std::vector<std::wstring> failedFiles;
+    std::mutex failedMutex;
+
+    unsigned int workerCount = ResolveWorkerCount(inputFiles.size());
+    if (workerCount <= 1) {
+        for (const fs::path& path : inputFiles) {
+            ConvertResult result = ConvertSingleFile(path, target);
+            if (result.ok) {
+                success.fetch_add(1);
+            } else {
+                failedFiles.push_back(path.filename().wstring() + L": " + result.message);
+            }
+        }
+    } else {
+        std::atomic<size_t> nextIndex(0);
+        std::vector<std::thread> workers;
+        workers.reserve(workerCount);
+
+        auto worker = [&]() {
+            while (true) {
+                size_t current = nextIndex.fetch_add(1);
+                if (current >= inputFiles.size()) {
+                    break;
+                }
+
+                const fs::path& path = inputFiles[current];
+                ConvertResult result = ConvertSingleFile(path, target);
+                if (result.ok) {
+                    success.fetch_add(1);
+                } else {
+                    std::lock_guard<std::mutex> lock(failedMutex);
+                    failedFiles.push_back(path.filename().wstring() + L": " + result.message);
+                }
+            }
+        };
+
+        for (unsigned int i = 0; i < workerCount; ++i) {
+            workers.emplace_back(worker);
+        }
+        for (std::thread& thread : workers) {
+            thread.join();
+        }
+    }
+
+    std::sort(failedFiles.begin(), failedFiles.end());
+
+    int successCount = success.load();
+    int fail = static_cast<int>(failedFiles.size());
+    DebugLog(L"result success=" + std::to_wstring(successCount) + L" fail=" + std::to_wstring(fail));
+    if (successCount == 0 && fail == 0) {
+        LocalFree(argv);
+        return 0;
+    }
+
+    std::wstring summary;
+    if (successCount > 0) {
+        summary += L"성공: " + std::to_wstring(successCount) + L"개";
+    }
+    if (fail > 0) {
+        if (!summary.empty()) {
+            summary += L"\n";
+        }
+        summary += L"실패: " + std::to_wstring(fail) + L"개";
+    }
+    if (fail > 0) {
+        summary += L"\n\n" + JoinFailures(failedFiles);
+    }
+    if (skippedCount > 0) {
+        summary += L"\n";
+        summary += L"건너뜀(자막 아님): " + std::to_wstring(skippedCount) + L"개";
+    }
+
+    if (!silentMode) {
+        MessageBoxW(nullptr,
+            summary.c_str(),
+            L"subConverter 변환 결과",
+            MB_OK | (fail > 0 ? MB_ICONWARNING : MB_ICONINFORMATION));
+    }
+
+    LocalFree(argv);
+    return fail == 0 ? 0 : 1;
+}
