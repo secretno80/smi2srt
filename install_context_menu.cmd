@@ -1,11 +1,18 @@
 @echo off
+chcp 65001 >nul
 setlocal
 
 set ROOT=%~dp0
 set EXE=%ROOT%build\subConverter.exe
+set ICO=%ROOT%icon.ico
 
 if not exist "%EXE%" (
   echo [ERROR] %EXE% 파일이 없습니다. 먼저 build.bat 을 실행하세요.
+  exit /b 1
+)
+
+if not exist "%ICO%" (
+  echo [ERROR] %ICO% 파일이 없습니다.
   exit /b 1
 )
 
@@ -23,18 +30,23 @@ set "ROOT=HKCU\Software\Classes\SystemFileAssociations\%EXT%\shell"
 reg delete "%ROOT%\subConverter" /f >nul 2>nul
 
 reg add "%ROOT%\subConverter.ToSmi" /ve /t REG_SZ /d "subConverter - ToSmi" /f >nul
-reg add "%ROOT%\subConverter.ToSmi" /v "Icon" /t REG_SZ /d "\"%EXE%\"" /f >nul
+reg add "%ROOT%\subConverter.ToSmi" /v "Icon" /t REG_SZ /d "\"%ICO%\"" /f >nul
 reg add "%ROOT%\subConverter.ToSmi" /v "MultiSelectModel" /t REG_SZ /d "Player" /f >nul
 reg add "%ROOT%\subConverter.ToSmi\command" /ve /t REG_SZ /d "\"%EXE%\" /to:smi \"%%1\"" /f >nul
 
 reg add "%ROOT%\subConverter.ToSrt" /ve /t REG_SZ /d "subConverter - ToSrt" /f >nul
-reg add "%ROOT%\subConverter.ToSrt" /v "Icon" /t REG_SZ /d "\"%EXE%\"" /f >nul
+reg add "%ROOT%\subConverter.ToSrt" /v "Icon" /t REG_SZ /d "\"%ICO%\"" /f >nul
 reg add "%ROOT%\subConverter.ToSrt" /v "MultiSelectModel" /t REG_SZ /d "Player" /f >nul
 reg add "%ROOT%\subConverter.ToSrt\command" /ve /t REG_SZ /d "\"%EXE%\" /to:srt \"%%1\"" /f >nul
 
 reg add "%ROOT%\subConverter.ToAss" /ve /t REG_SZ /d "subConverter - ToAss" /f >nul
-reg add "%ROOT%\subConverter.ToAss" /v "Icon" /t REG_SZ /d "\"%EXE%\"" /f >nul
+reg add "%ROOT%\subConverter.ToAss" /v "Icon" /t REG_SZ /d "\"%ICO%\"" /f >nul
 reg add "%ROOT%\subConverter.ToAss" /v "MultiSelectModel" /t REG_SZ /d "Player" /f >nul
 reg add "%ROOT%\subConverter.ToAss\command" /ve /t REG_SZ /d "\"%EXE%\" /to:ass \"%%1\"" /f >nul
+
+reg add "%ROOT%\subConverter.Rename" /ve /t REG_SZ /d "subConverter - 이름변경(정규식)" /f >nul
+reg add "%ROOT%\subConverter.Rename" /v "Icon" /t REG_SZ /d "\"%ICO%\"" /f >nul
+reg add "%ROOT%\subConverter.Rename" /v "MultiSelectModel" /t REG_SZ /d "Player" /f >nul
+reg add "%ROOT%\subConverter.Rename\command" /ve /t REG_SZ /d "\"%EXE%\" /mode:rename \"%%1\"" /f >nul
 
 exit /b 0

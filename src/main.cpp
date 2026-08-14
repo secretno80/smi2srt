@@ -2,10 +2,15 @@
 #include <windows.h>
 #include <shellapi.h>
 
+#include "resource.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cmath>
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <map>
 #include <mutex>
@@ -47,6 +52,20 @@ std::wstring Trim(const std::wstring& value) {
         --end;
     }
     return value.substr(begin, end - begin);
+}
+
+// Prefix long/UNC paths with the \\?\ extended-length marker so file I/O
+// stays reliable near or beyond MAX_PATH and on \\server\share paths.
+std::wstring ToLongPath(const std::wstring& rawPath) {
+    std::wstring ioPath = rawPath;
+    if (ioPath.rfind(L"\\\\?\\", 0) != 0) {
+        if (ioPath.rfind(L"\\\\", 0) == 0) {
+            ioPath = L"\\\\?\\UNC\\" + ioPath.substr(2);
+        } else if (ioPath.size() >= 248) {
+            ioPath = L"\\\\?\\" + ioPath;
+        }
+    }
+    return ioPath;
 }
 
 std::wstring ToLowerW(std::wstring value) {
@@ -490,6 +509,15 @@ bool IsCreatorCreditCaption(const std::wstring& text) {
         return false;
     }
 
+    // Email addresses are almost always a feedback contact left by the
+    // subtitle author, never real dialogue. Check the lightly-trimmed
+    // original text so punctuation (@, .) survives.
+    std::wstring rawLower = ToLowerW(Trim(text));
+    static const std::wregex emailPattern(LR"([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})", std::regex_constants::icase);
+    if (std::regex_search(rawLower, emailPattern)) {
+        return true;
+    }
+
     static const std::vector<std::wstring> creditTokens = {
         L"smi by",
         L"sub by",
@@ -507,6 +535,9 @@ bool IsCreatorCreditCaption(const std::wstring& text) {
         L"encoded by",
         L"edited by",
         L"ripped by",
+        L"downloaded from",
+        L"download from",
+        L"ripped from",
         L"번역 by",
         L"자막 by",
         L"제작 by",
@@ -531,6 +562,34 @@ bool IsCreatorCreditCaption(const std::wstring& text) {
 
     for (const auto& pattern : creditPatterns) {
         if (std::regex_search(normalized, pattern)) {
+            return true;
+        }
+    }
+
+    // Lines that open with a "자막:"/"번역:"/"subtitle:" style label are
+    // almost always a standalone credit line, not dialogue.
+    static const std::wregex labelColonPattern(
+        LR"(^\s*(자막|번역|제작|싱크|수정|변환|제공|sub|smi|srt|ass|subtitle|translat\w*|encode\w*|sync|rip\w*)\s*[:：])",
+        std::regex_constants::icase);
+    if (std::regex_search(rawLower, labelColonPattern)) {
+        return true;
+    }
+
+    // Short lines combining two credit-action words without "by" or a colon
+    // (e.g. "SUB 변환 Jone Dow") are also very likely to be a credit line.
+    if (normalized.size() <= 40) {
+        static const std::vector<std::wstring> actionTokens = {
+            L"변환", L"제작", L"수정", L"싱크", L"번역", L"자막", L"제공", L"전달",
+            L"sub", L"smi", L"srt", L"ass", L"subtitle", L"convert", L"conversion",
+            L"encode", L"encoded", L"sync", L"translat", L"rip"
+        };
+        int hits = 0;
+        for (const auto& token : actionTokens) {
+            if (normalized.find(token) != std::wstring::npos) {
+                ++hits;
+            }
+        }
+        if (hits >= 2) {
             return true;
         }
     }
@@ -811,7 +870,9 @@ int ComputeNameScore(const fs::path& subtitlePath, const fs::path& videoPath) {
     return score;
 }
 
-std::wstring ResolveMatchedVideoStem(const fs::path& subtitlePath) {
+// Returns the path of the video file in the same folder that best matches
+// |subtitlePath|'s name, or an empty path if none/no confident match exists.
+fs::path ResolveMatchedVideoPath(const fs::path& subtitlePath) {
     std::vector<fs::path> videos;
     try {
         for (const auto& entry : fs::directory_iterator(subtitlePath.parent_path())) {
@@ -824,14 +885,14 @@ std::wstring ResolveMatchedVideoStem(const fs::path& subtitlePath) {
             }
         }
     } catch (...) {
-        return subtitlePath.stem().wstring();
+        return fs::path();
     }
 
     if (videos.empty()) {
-        return subtitlePath.stem().wstring();
+        return fs::path();
     }
     if (videos.size() == 1) {
-        return videos[0].stem().wstring();
+        return videos[0];
     }
 
     int bestScore = -999999;
@@ -850,25 +911,309 @@ std::wstring ResolveMatchedVideoStem(const fs::path& subtitlePath) {
     }
 
     if (bestScore >= 24 && (bestScore - secondScore >= 12 || secondScore < 0)) {
-        return bestPath.stem().wstring();
+        return bestPath;
     }
 
-    return subtitlePath.stem().wstring();
+    return fs::path();
 }
 
-std::string GuessLangFromClass(const std::wstring& cls) {
-    std::wstring l = ToLowerW(cls);
-    if (l.find(L"kr") != std::wstring::npos || l.find(L"ko") != std::wstring::npos || l.find(L"kor") != std::wstring::npos) {
-        return "ko";
-    }
-    if (l.find(L"en") != std::wstring::npos || l.find(L"eng") != std::wstring::npos) {
-        return "en";
-    }
-    if (l.find(L"jp") != std::wstring::npos || l.find(L"ja") != std::wstring::npos || l.find(L"jpn") != std::wstring::npos) {
-        return "jp";
-    }
-    return "";
+std::wstring ResolveMatchedVideoStem(const fs::path& subtitlePath) {
+    fs::path matched = ResolveMatchedVideoPath(subtitlePath);
+    return matched.empty() ? subtitlePath.stem().wstring() : matched.stem().wstring();
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Video pixel-dimension detection (no external libraries).
+// Supports ISO-BMFF (mp4/mov/m4v) via the 'tkhd' box and Matroska/WebM
+// (mkv/webm) via EBML PixelWidth/PixelHeight, read directly from the file
+// header without decoding video data.
+// ─────────────────────────────────────────────────────────────────────────────
+
+bool ReadExactBytes(HANDLE h, void* buffer, DWORD length) {
+    DWORD readBytes = 0;
+    return ReadFile(h, buffer, length, &readBytes, nullptr) && readBytes == length;
+}
+
+bool SeekAbsolute(HANDLE h, uint64_t pos) {
+    LARGE_INTEGER li;
+    li.QuadPart = static_cast<LONGLONG>(pos);
+    return SetFilePointerEx(h, li, nullptr, FILE_BEGIN) != 0;
+}
+
+uint32_t ReadBigEndian32(const unsigned char* p) {
+    return (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
+           (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
+}
+
+// Recursively walks ISO-BMFF boxes looking for the first video track's
+// pixel dimensions, taken from that track's 'tkhd' box (width/height are
+// 16.16 fixed-point; audio tracks report 0x0 so they're skipped naturally).
+bool FindMp4VideoSize(HANDLE h, uint64_t start, uint64_t end, int depth, int& outW, int& outH) {
+    if (depth > 8) {
+        return false;
+    }
+
+    uint64_t pos = start;
+    while (pos + 8 <= end) {
+        if (!SeekAbsolute(h, pos)) return false;
+        unsigned char hdr[8];
+        if (!ReadExactBytes(h, hdr, 8)) return false;
+
+        uint64_t boxSize = ReadBigEndian32(hdr);
+        char type[5] = {0};
+        std::memcpy(type, hdr + 4, 4);
+        uint64_t headerLen = 8;
+
+        if (boxSize == 1) {
+            unsigned char ext[8];
+            if (!ReadExactBytes(h, ext, 8)) return false;
+            boxSize = (static_cast<uint64_t>(ReadBigEndian32(ext)) << 32) | ReadBigEndian32(ext + 4);
+            headerLen = 16;
+        } else if (boxSize == 0) {
+            boxSize = end - pos;
+        }
+
+        if (boxSize < headerLen || pos + boxSize > end) {
+            break;
+        }
+
+        uint64_t contentStart = pos + headerLen;
+        uint64_t contentEnd = pos + boxSize;
+        std::string boxType(type);
+
+        if (boxType == "moov" || boxType == "trak" || boxType == "mdia" ||
+            boxType == "minf" || boxType == "stbl") {
+            if (FindMp4VideoSize(h, contentStart, contentEnd, depth + 1, outW, outH)) {
+                return true;
+            }
+        } else if (boxType == "tkhd") {
+            unsigned char versionFlags[4];
+            if (SeekAbsolute(h, contentStart) && ReadExactBytes(h, versionFlags, 4)) {
+                int version = versionFlags[0];
+                uint64_t widthOffset = contentStart +
+                    (version == 1 ? (4 + 32 + 8 + 8 + 36) : (4 + 20 + 8 + 8 + 36));
+                unsigned char whBytes[8];
+                if (SeekAbsolute(h, widthOffset) && ReadExactBytes(h, whBytes, 8)) {
+                    int w = static_cast<int>(ReadBigEndian32(whBytes) >> 16);
+                    int trackH = static_cast<int>(ReadBigEndian32(whBytes + 4) >> 16);
+                    if (w > 0 && trackH > 0) {
+                        outW = w;
+                        outH = trackH;
+                        return true;
+                    }
+                }
+            }
+        }
+
+        pos += boxSize;
+    }
+
+    return false;
+}
+
+// Reads an EBML variable-length integer at |pos|, advancing it past the
+// element. |keepMarker| controls whether the length-marker bit stays in the
+// returned value (required for element IDs, stripped for size fields).
+bool ReadEbmlVint(HANDLE h, uint64_t& pos, uint64_t end, bool keepMarker, uint64_t& value, int& lenOut) {
+    if (pos >= end || !SeekAbsolute(h, pos)) {
+        return false;
+    }
+    unsigned char first;
+    if (!ReadExactBytes(h, &first, 1)) return false;
+
+    int len = 0;
+    for (int i = 0; i < 8; ++i) {
+        if (first & (0x80 >> i)) {
+            len = i + 1;
+            break;
+        }
+    }
+    if (len == 0 || pos + len > end) {
+        return false;
+    }
+
+    unsigned char buf[8] = {0};
+    buf[0] = first;
+    if (len > 1 && !ReadExactBytes(h, buf + 1, static_cast<DWORD>(len - 1))) {
+        return false;
+    }
+
+    uint64_t v;
+    if (keepMarker) {
+        v = 0;
+        for (int i = 0; i < len; ++i) v = (v << 8) | buf[i];
+    } else {
+        v = buf[0] & static_cast<unsigned char>(0xFF >> len);
+        for (int i = 1; i < len; ++i) v = (v << 8) | buf[i];
+    }
+
+    value = v;
+    lenOut = len;
+    pos += len;
+    return true;
+}
+
+// Resolves an EBML element's content end offset, treating the reserved
+// "all value bits set to 1" size encoding as unknown/unbounded (extends to
+// the parent's end, per the Matroska spec).
+uint64_t ResolveEbmlContentEnd(uint64_t contentStart, uint64_t size, int sizeLen, uint64_t parentEnd) {
+    uint64_t maxVal = (sizeLen >= 8) ? ~0ULL : ((1ULL << (7 * sizeLen)) - 1);
+    if (size == maxVal) {
+        return parentEnd;
+    }
+    uint64_t contentEnd = contentStart + size;
+    return std::min(contentEnd, parentEnd);
+}
+
+constexpr uint64_t kEbmlIdSegment = 0x18538067;
+constexpr uint64_t kEbmlIdTracks = 0x1654AE6B;
+constexpr uint64_t kEbmlIdTrackEntry = 0xAE;
+constexpr uint64_t kEbmlIdTrackType = 0x83;
+constexpr uint64_t kEbmlIdVideo = 0xE0;
+constexpr uint64_t kEbmlIdPixelWidth = 0xB0;
+constexpr uint64_t kEbmlIdPixelHeight = 0xBA;
+
+bool FindMkvVideoSizeInTrackEntry(HANDLE h, uint64_t start, uint64_t end, int& outW, int& outH) {
+    uint64_t pos = start;
+    bool isVideoTrack = false;
+    int width = 0;
+    int height = 0;
+
+    while (pos < end) {
+        uint64_t id, size;
+        int idLen, sizeLen;
+        if (!ReadEbmlVint(h, pos, end, true, id, idLen)) break;
+        if (!ReadEbmlVint(h, pos, end, false, size, sizeLen)) break;
+
+        uint64_t contentStart = pos;
+        uint64_t contentEnd = ResolveEbmlContentEnd(contentStart, size, sizeLen, end);
+
+        if (id == kEbmlIdTrackType) {
+            unsigned char v;
+            if (SeekAbsolute(h, contentStart) && ReadExactBytes(h, &v, 1)) {
+                isVideoTrack = (v == 1);
+            }
+        } else if (id == kEbmlIdVideo) {
+            uint64_t vp = contentStart;
+            while (vp < contentEnd) {
+                uint64_t vid, vsize;
+                int vidLen, vsizeLen;
+                if (!ReadEbmlVint(h, vp, contentEnd, true, vid, vidLen)) break;
+                if (!ReadEbmlVint(h, vp, contentEnd, false, vsize, vsizeLen)) break;
+
+                if ((vid == kEbmlIdPixelWidth || vid == kEbmlIdPixelHeight) && vsize <= 8) {
+                    unsigned char buf[8] = {0};
+                    if (SeekAbsolute(h, vp) && ReadExactBytes(h, buf, static_cast<DWORD>(vsize))) {
+                        uint64_t val = 0;
+                        for (uint64_t i = 0; i < vsize; ++i) val = (val << 8) | buf[i];
+                        if (vid == kEbmlIdPixelWidth) width = static_cast<int>(val);
+                        else height = static_cast<int>(val);
+                    }
+                }
+                vp += vsize;
+            }
+        }
+
+        pos = contentEnd;
+    }
+
+    if (isVideoTrack && width > 0 && height > 0) {
+        outW = width;
+        outH = height;
+        return true;
+    }
+    return false;
+}
+
+bool FindMkvVideoSize(HANDLE h, uint64_t start, uint64_t end, int& outW, int& outH) {
+    uint64_t pos = start;
+    while (pos < end) {
+        uint64_t id, size;
+        int idLen, sizeLen;
+        if (!ReadEbmlVint(h, pos, end, true, id, idLen)) break;
+        if (!ReadEbmlVint(h, pos, end, false, size, sizeLen)) break;
+
+        uint64_t contentStart = pos;
+        uint64_t contentEnd = ResolveEbmlContentEnd(contentStart, size, sizeLen, end);
+
+        if (id == kEbmlIdSegment) {
+            if (FindMkvVideoSize(h, contentStart, contentEnd, outW, outH)) {
+                return true;
+            }
+        } else if (id == kEbmlIdTracks) {
+            uint64_t tp = contentStart;
+            while (tp < contentEnd) {
+                uint64_t tid, tsize;
+                int tidLen, tsizeLen;
+                if (!ReadEbmlVint(h, tp, contentEnd, true, tid, tidLen)) break;
+                if (!ReadEbmlVint(h, tp, contentEnd, false, tsize, tsizeLen)) break;
+
+                uint64_t entryEnd = ResolveEbmlContentEnd(tp, tsize, tsizeLen, contentEnd);
+                if (tid == kEbmlIdTrackEntry) {
+                    if (FindMkvVideoSizeInTrackEntry(h, tp, entryEnd, outW, outH)) {
+                        return true;
+                    }
+                }
+                tp = entryEnd;
+            }
+        }
+
+        pos = contentEnd;
+    }
+    return false;
+}
+
+// Detects the pixel width/height of a video file by reading its container
+// header directly (mp4/mov/m4v via ISO-BMFF, mkv/webm via EBML). Returns
+// false if the format isn't supported or dimensions couldn't be found.
+bool GetVideoDimensions(const fs::path& videoPath, int& width, int& height) {
+    std::wstring ext = ToLowerW(videoPath.extension().wstring());
+    bool isMp4Family = (ext == L".mp4" || ext == L".mov" || ext == L".m4v");
+    bool isMkvFamily = (ext == L".mkv" || ext == L".webm");
+    if (!isMp4Family && !isMkvFamily) {
+        return false;
+    }
+
+    std::wstring ioPath = ToLongPath(videoPath.wstring());
+    HANDLE h = CreateFileW(
+        ioPath.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    LARGE_INTEGER fileSize{};
+    if (!GetFileSizeEx(h, &fileSize) || fileSize.QuadPart <= 0) {
+        CloseHandle(h);
+        return false;
+    }
+
+    bool ok;
+    if (isMp4Family) {
+        ok = FindMp4VideoSize(h, 0, static_cast<uint64_t>(fileSize.QuadPart), 0, width, height);
+    } else {
+        ok = FindMkvVideoSize(h, 0, static_cast<uint64_t>(fileSize.QuadPart), width, height);
+    }
+
+    CloseHandle(h);
+    return ok;
+}
+
+// Marker prefix used for a caption's `lang` field until ResolveTextBasedLanguages
+// resolves it from actual text content. SMI captions get one marker per raw
+// class value (so distinct tracks stay distinct groups even though the class
+// name itself is never trusted — some SMI files mislabel a track, e.g. a
+// Korean-only file whose only track is still named ENCC); SRT/ASS captions,
+// which have no per-line class concept, all share a single marker (one
+// group per file). Resolving per group instead of per line also avoids
+// fragmenting a single-language file into spurious one-line "en"/"ko"
+// output files whenever an odd line's script mix would tip a per-line guess.
+const char* const kPendingLangMarker = "?";
 
 std::string GuessLangFromText(const std::wstring& text) {
     int ko = 0;
@@ -895,6 +1240,46 @@ std::string GuessLangFromText(const std::wstring& text) {
         return "jp";
     }
     return "und";
+}
+
+// Resolves each group of captions still carrying a kPendingLangMarker-based
+// `lang` (every SRT/ASS caption, and every SMI caption grouped by its raw
+// class value) into a single concrete language code derived from the actual
+// text. Rather than guessing per line, this samples a handful of captions starting around the
+// 5th real line in the group — skipping any short/atypical opening lines —
+// and picks the language with the highest character share across that
+// sample, then applies it to every caption in the group. This keeps a
+// single-language source from being fragmented into stray one-line output
+// files whenever an odd line's script mix would tip a per-line guess.
+void ResolveTextBasedLanguages(std::vector<Caption>& captions) {
+    std::map<std::string, std::vector<size_t>> pendingGroups;
+    for (size_t i = 0; i < captions.size(); ++i) {
+        if (captions[i].lang.rfind(kPendingLangMarker, 0) == 0) {
+            pendingGroups[captions[i].lang].push_back(i);
+        }
+    }
+
+    for (auto& [groupKey, indices] : pendingGroups) {
+        size_t sampleStart = indices.size() > 4 ? 4 : 0;
+
+        std::wstring sample;
+        for (size_t k = sampleStart; k < indices.size() && sample.size() < 200; ++k) {
+            sample += captions[indices[k]].text;
+        }
+        if (sample.size() < 20) {
+            // Not enough sampled text to be confident; fall back to the
+            // whole group's text.
+            sample.clear();
+            for (size_t idx : indices) {
+                sample += captions[idx].text;
+            }
+        }
+
+        std::string resolved = GuessLangFromText(sample);
+        for (size_t idx : indices) {
+            captions[idx].lang = resolved;
+        }
+    }
 }
 
 std::wstring FormatTimestamp(int totalMs) {
@@ -951,10 +1336,13 @@ std::vector<Caption> ParseSmiCaptions(const std::wstring& content) {
             if (text.empty()) {
                 continue;
             }
-            std::string lang = GuessLangFromClass(cls);
-            if (lang.empty()) {
-                lang = GuessLangFromText(text);
-            }
+            // The class name (e.g. KRCC/ENCC) only tells us which nominal
+            // track a line belongs to — some SMI files mislabel a track
+            // (e.g. a Korean-only file whose only track is still named
+            // ENCC), so the actual language is always resolved from the
+            // real text content later, never trusted from the class name.
+            std::wstring normalizedClass = ToLowerW(cls);
+            std::string lang = kPendingLangMarker + std::string(normalizedClass.begin(), normalizedClass.end());
 
             parsed.push_back({startMs, inferredEndMs, text, innerHtml, lang});
             addedAny = true;
@@ -963,7 +1351,7 @@ std::vector<Caption> ParseSmiCaptions(const std::wstring& content) {
         if (!addedAny) {
             std::wstring text = NormalizeSubtitleText(block);
             if (!text.empty()) {
-                parsed.push_back({startMs, inferredEndMs, text, block, GuessLangFromText(text)});
+                parsed.push_back({startMs, inferredEndMs, text, block, kPendingLangMarker});
             }
         }
     }
@@ -992,7 +1380,7 @@ std::vector<Caption> ParseSrtCaptions(const std::wstring& content) {
         if (startMs < 0 || endMs <= startMs || text.empty()) {
             continue;
         }
-        parsed.push_back({startMs, endMs, text, L"", GuessLangFromText(text)});
+        parsed.push_back({startMs, endMs, text, L"", kPendingLangMarker});
     }
 
     std::sort(parsed.begin(), parsed.end(), [](const Caption& left, const Caption& right) {
@@ -1074,7 +1462,7 @@ std::vector<Caption> ParseAssCaptions(const std::wstring& content) {
             continue;
         }
 
-        parsed.push_back({startMs, endMs, text, L"", GuessLangFromText(text)});
+        parsed.push_back({startMs, endMs, text, L"", kPendingLangMarker});
     }
 
     std::sort(parsed.begin(), parsed.end(), [](const Caption& left, const Caption& right) {
@@ -1532,7 +1920,7 @@ bool TryExtractUniformStyle(const std::wstring& text,
     return true;
 }
 
-std::wstring BuildAssText(const std::vector<Caption>& items) {
+std::wstring BuildAssText(const std::vector<Caption>& items, int playResX, int playResY, int baseFontSize) {
     // ── Pass 1: generate per-item ASS text and detect uniform styles ──────────
     struct ItemInfo {
         std::wstring assText;      // dialogue text after local optimization
@@ -1608,13 +1996,14 @@ std::wstring BuildAssText(const std::vector<Caption>& items) {
     ass += L"[Script Info]\r\n";
     ass += L"Title: subConverter\r\n";
     ass += L"ScriptType: v4.00+\r\n";
-    ass += L"PlayResX: 1280\r\n";
-    ass += L"PlayResY: 720\r\n";
+    ass += L"PlayResX: " + std::to_wstring(playResX) + L"\r\n";
+    ass += L"PlayResY: " + std::to_wstring(playResY) + L"\r\n";
     ass += L"WrapStyle: 0\r\n";
     ass += L"ScaledBorderAndShadow: yes\r\n\r\n";
     ass += L"[V4+ Styles]\r\n";
     ass += L"Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\r\n";
-    ass += L"Style: Default,Arial,24,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,2,1,2,20,20,20,0\r\n";
+    ass += L"Style: Default,Arial," + std::to_wstring(baseFontSize) +
+           L",&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,2,1,2,20,20,20,0\r\n";
 
     // Named styles sorted alphabetically for deterministic output
     std::vector<std::pair<std::wstring, StyleDef>> sortedStyles;
@@ -1661,12 +2050,13 @@ std::wstring TargetExtension(TargetFormat target) {
     return L".srt";
 }
 
-std::wstring BuildOutputText(TargetFormat target, const std::vector<Caption>& items) {
+std::wstring BuildOutputText(TargetFormat target, const std::vector<Caption>& items,
+                              int playResX = 1280, int playResY = 720, int baseFontSize = 24) {
     if (target == TargetFormat::ToSmi) {
         return BuildSmiText(items);
     }
     if (target == TargetFormat::ToAss) {
-        return BuildAssText(items);
+        return BuildAssText(items, playResX, playResY, baseFontSize);
     }
     return BuildSrtText(items);
 }
@@ -1701,15 +2091,7 @@ bool WriteUtf8File(const fs::path& outPath, const std::wstring& content) {
     std::string utf8(static_cast<size_t>(needed), '\0');
     WideCharToMultiByte(CP_UTF8, 0, content.c_str(), static_cast<int>(content.size()), utf8.data(), needed, nullptr, nullptr);
 
-    std::wstring rawPath = outPath.wstring();
-    std::wstring ioPath = rawPath;
-    if (ioPath.rfind(L"\\\\?\\", 0) != 0) {
-        if (ioPath.rfind(L"\\\\", 0) == 0) {
-            ioPath = L"\\\\?\\UNC\\" + ioPath.substr(2);
-        } else if (ioPath.size() >= 248) {
-            ioPath = L"\\\\?\\" + ioPath;
-        }
-    }
+    std::wstring ioPath = ToLongPath(outPath.wstring());
 
     HANDLE out = CreateFileW(
         ioPath.c_str(),
@@ -1748,15 +2130,7 @@ bool WriteUtf8File(const fs::path& outPath, const std::wstring& content) {
 }
 
 ConvertResult ConvertSingleFile(const fs::path& inputPath, TargetFormat target) {
-    std::wstring rawPath = inputPath.wstring();
-    std::wstring ioPath = rawPath;
-    if (ioPath.rfind(L"\\\\?\\", 0) != 0) {
-        if (ioPath.rfind(L"\\\\", 0) == 0) {
-            ioPath = L"\\\\?\\UNC\\" + ioPath.substr(2);
-        } else if (ioPath.size() >= 248) {
-            ioPath = L"\\\\?\\" + ioPath;
-        }
-    }
+    std::wstring ioPath = ToLongPath(inputPath.wstring());
 
     HANDLE in = CreateFileW(
         ioPath.c_str(),
@@ -1805,12 +2179,11 @@ ConvertResult ConvertSingleFile(const fs::path& inputPath, TargetFormat target) 
         return {false, L"변환 가능한 자막 구간을 찾지 못했습니다."};
     }
 
-    if (inputExt == L".smi") {
-        RemoveCreditCaptions(captions);
-        if (captions.empty()) {
-            return {false, L"크레딧(제작자 정보) 제거 후 변환 가능한 자막이 없습니다."};
-        }
+    RemoveCreditCaptions(captions);
+    if (captions.empty()) {
+        return {false, L"크레딧(제작자 정보) 제거 후 변환 가능한 자막이 없습니다."};
     }
+    ResolveTextBasedLanguages(captions);
 
     std::map<std::string, std::vector<Caption>> byLang;
     for (const Caption& caption : captions) {
@@ -1818,8 +2191,22 @@ ConvertResult ConvertSingleFile(const fs::path& inputPath, TargetFormat target) 
         byLang[lang].push_back(caption);
     }
 
-    std::wstring outputBaseStem = ResolveMatchedVideoStem(inputPath);
+    fs::path matchedVideo = ResolveMatchedVideoPath(inputPath);
+    std::wstring outputBaseStem = matchedVideo.empty() ? inputPath.stem().wstring() : matchedVideo.stem().wstring();
     std::wstring outputExt = TargetExtension(target);
+
+    int playResX = 1280;
+    int playResY = 720;
+    int baseFontSize = 24;
+    if (target == TargetFormat::ToAss && !matchedVideo.empty()) {
+        int videoW = 0;
+        int videoH = 0;
+        if (GetVideoDimensions(matchedVideo, videoW, videoH) && videoW > 0 && videoH > 0) {
+            playResX = videoW;
+            playResY = videoH;
+            baseFontSize = std::max(10, static_cast<int>(std::lround(24.0 * videoH / 720.0)));
+        }
+    }
 
     for (auto& pair : byLang) {
         auto& items = pair.second;
@@ -1830,7 +2217,7 @@ ConvertResult ConvertSingleFile(const fs::path& inputPath, TargetFormat target) 
             return left.startMs < right.startMs;
         });
 
-        std::wstring outText = BuildOutputText(target, items);
+        std::wstring outText = BuildOutputText(target, items, playResX, playResY, baseFontSize);
 
         fs::path out = inputPath.parent_path() / outputBaseStem;
         if (pair.first != "und") {
@@ -1908,26 +2295,30 @@ static const wchar_t* COLLECTOR_MUTEX_NAME = L"Local\\smi2srt_collector";
 static const wchar_t* QUEUE_WRITE_MUTEX_NAME = L"Local\\smi2srt_queue_writer";
 static const wchar_t* QUEUE_FILE_NAME = L"smi2srt_queue.txt";
 
-std::wstring GetQueueFilePath() {
+static const wchar_t* RENAME_COLLECTOR_MUTEX_NAME = L"Local\\subConverter_rename_collector";
+static const wchar_t* RENAME_QUEUE_WRITE_MUTEX_NAME = L"Local\\subConverter_rename_queue_writer";
+static const wchar_t* RENAME_QUEUE_FILE_NAME = L"subConverter_rename_queue.txt";
+
+std::wstring GetQueueFilePath(const wchar_t* queueFileName) {
     wchar_t tmp[MAX_PATH] = {};
     GetTempPathW(MAX_PATH, tmp);
     std::wstring path = tmp;
     if (!path.empty() && path.back() != L'\\') {
         path += L'\\';
     }
-    path += QUEUE_FILE_NAME;
+    path += queueFileName;
     return path;
 }
 
-void EnqueueFiles(const std::vector<fs::path>& files) {
-    HANDLE writeMutex = CreateMutexW(nullptr, FALSE, QUEUE_WRITE_MUTEX_NAME);
+void EnqueueFiles(const std::vector<fs::path>& files, const wchar_t* writeMutexName, const wchar_t* queueFileName) {
+    HANDLE writeMutex = CreateMutexW(nullptr, FALSE, writeMutexName);
     if (!writeMutex) {
         return;
     }
 
     WaitForSingleObject(writeMutex, INFINITE);
 
-    std::wstring queuePath = GetQueueFilePath();
+    std::wstring queuePath = GetQueueFilePath(queueFileName);
     HANDLE h = CreateFileW(queuePath.c_str(), FILE_APPEND_DATA,
                            FILE_SHARE_READ | FILE_SHARE_WRITE,
                            nullptr, OPEN_ALWAYS,
@@ -1953,8 +2344,8 @@ void EnqueueFiles(const std::vector<fs::path>& files) {
     CloseHandle(writeMutex);
 }
 
-std::vector<fs::path> DrainQueue() {
-    std::wstring queuePath = GetQueueFilePath();
+std::vector<fs::path> DrainQueue(const wchar_t* queueFileName, bool filterSubtitleExt) {
+    std::wstring queuePath = GetQueueFilePath(queueFileName);
     std::vector<fs::path> result;
 
     HANDLE hFile = CreateFileW(queuePath.c_str(), GENERIC_READ,
@@ -1982,7 +2373,7 @@ std::vector<fs::path> DrainQueue() {
         line = Trim(line);
         if (!line.empty()) {
             fs::path p(line);
-            if (IsSubtitleExtension(p.extension().wstring())) {
+            if (!filterSubtitleExt || IsSubtitleExtension(p.extension().wstring())) {
                 result.push_back(p);
             }
         }
@@ -2020,12 +2411,279 @@ unsigned int ResolveWorkerCount(size_t fileCount) {
     return std::max(1u, workerCount);
 }
 
-int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
+// ─────────────────────────────────────────────────────────────────────────────
+// Regex-based batch rename ("subConverter - 이름변경(정규식)")
+// Lists every file in the folder of the file(s) the user right-clicked and
+// lets them find/replace a regex pattern across all filenames in that folder.
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct RenamePlanItem {
+    fs::path oldPath;
+    std::wstring newName;
+    bool changed;
+};
+
+struct RenameDialogContext {
+    fs::path folder;
+    std::vector<fs::path> files;
+};
+
+std::vector<RenamePlanItem> BuildRenamePlan(const std::vector<fs::path>& allFiles,
+                                             const std::wstring& pattern,
+                                             const std::wstring& replacement,
+                                             bool ignoreCase,
+                                             bool& regexValid) {
+    std::vector<RenamePlanItem> plan;
+    regexValid = true;
+
+    if (pattern.empty()) {
+        for (const auto& f : allFiles) {
+            plan.push_back({f, f.filename().wstring(), false});
+        }
+        return plan;
+    }
+
+    std::wregex re;
+    try {
+        auto flags = std::regex_constants::ECMAScript;
+        if (ignoreCase) {
+            flags |= std::regex_constants::icase;
+        }
+        re = std::wregex(pattern, flags);
+    } catch (...) {
+        regexValid = false;
+        for (const auto& f : allFiles) {
+            plan.push_back({f, f.filename().wstring(), false});
+        }
+        return plan;
+    }
+
+    for (const auto& f : allFiles) {
+        std::wstring name = f.filename().wstring();
+        bool matched = std::regex_search(name, re);
+        std::wstring newName = matched ? std::regex_replace(name, re, replacement) : name;
+        plan.push_back({f, newName, matched && newName != name && !newName.empty()});
+    }
+    return plan;
+}
+
+void RefreshRenamePreview(HWND hDlg, RenameDialogContext* ctx) {
+    wchar_t patternBuf[1024] = {};
+    wchar_t replaceBuf[1024] = {};
+    GetDlgItemTextW(hDlg, IDC_RENAME_PATTERN, patternBuf, 1024);
+    GetDlgItemTextW(hDlg, IDC_RENAME_REPLACE, replaceBuf, 1024);
+    bool ignoreCase = (IsDlgButtonChecked(hDlg, IDC_RENAME_IGNORECASE) == BST_CHECKED);
+
+    bool regexValid = true;
+    std::vector<RenamePlanItem> plan = BuildRenamePlan(ctx->files, patternBuf, replaceBuf, ignoreCase, regexValid);
+
+    HWND list = GetDlgItem(hDlg, IDC_RENAME_LIST);
+    SendMessageW(list, LB_RESETCONTENT, 0, 0);
+
+    int matchCount = 0;
+    for (const auto& item : plan) {
+        std::wstring oldName = item.oldPath.filename().wstring();
+        std::wstring line;
+        if (item.changed) {
+            line = oldName + L"  ->  " + item.newName;
+            ++matchCount;
+        } else {
+            line = oldName + L"  (변경 없음)";
+        }
+        SendMessageW(list, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(line.c_str()));
+    }
+
+    std::wstring status;
+    if (!regexValid) {
+        status = L"정규식 오류: 패턴을 확인하세요.";
+    } else if (std::wstring(patternBuf).empty()) {
+        status = L"패턴을 입력하면 미리보기가 표시됩니다. (전체 " + std::to_wstring(plan.size()) + L"개 파일)";
+    } else {
+        status = L"전체 " + std::to_wstring(plan.size()) + L"개 중 " +
+                 std::to_wstring(matchCount) + L"개 매칭됨";
+    }
+    SetDlgItemTextW(hDlg, IDC_RENAME_STATUS, status.c_str());
+    EnableWindow(GetDlgItem(hDlg, IDC_RENAME_APPLY_BTN), regexValid && matchCount > 0);
+}
+
+void ApplyRenamePlan(HWND hDlg, RenameDialogContext* ctx) {
+    wchar_t patternBuf[1024] = {};
+    wchar_t replaceBuf[1024] = {};
+    GetDlgItemTextW(hDlg, IDC_RENAME_PATTERN, patternBuf, 1024);
+    GetDlgItemTextW(hDlg, IDC_RENAME_REPLACE, replaceBuf, 1024);
+    bool ignoreCase = (IsDlgButtonChecked(hDlg, IDC_RENAME_IGNORECASE) == BST_CHECKED);
+
+    bool regexValid = true;
+    std::vector<RenamePlanItem> plan = BuildRenamePlan(ctx->files, patternBuf, replaceBuf, ignoreCase, regexValid);
+    if (!regexValid) {
+        MessageBoxW(hDlg, L"정규식이 올바르지 않습니다.", L"subConverter", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    std::vector<RenamePlanItem> toApply;
+    for (const auto& item : plan) {
+        if (item.changed) {
+            toApply.push_back(item);
+        }
+    }
+    if (toApply.empty()) {
+        MessageBoxW(hDlg, L"변경될 파일이 없습니다.", L"subConverter", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    std::wstring confirmMsg = std::to_wstring(toApply.size()) + L"개 파일의 이름을 변경하시겠습니까?";
+    if (MessageBoxW(hDlg, confirmMsg.c_str(), L"subConverter", MB_YESNO | MB_ICONQUESTION) != IDYES) {
+        return;
+    }
+
+    int successCount = 0;
+    int failCount = 0;
+    for (const auto& item : toApply) {
+        fs::path target = item.oldPath.parent_path() / item.newName;
+        if (ToLowerW(target.wstring()) != ToLowerW(item.oldPath.wstring())) {
+            target = EnsureUniqueOutputPath(target);
+        }
+        std::error_code ec;
+        fs::rename(item.oldPath, target, ec);
+        if (ec) {
+            ++failCount;
+        } else {
+            ++successCount;
+        }
+    }
+
+    std::wstring resultMsg = L"성공: " + std::to_wstring(successCount) + L"개";
+    if (failCount > 0) {
+        resultMsg += L"\n실패: " + std::to_wstring(failCount) + L"개";
+    }
+    MessageBoxW(hDlg, resultMsg.c_str(), L"subConverter 이름 변경 결과", MB_OK | MB_ICONINFORMATION);
+
+    EndDialog(hDlg, 1);
+}
+
+INT_PTR CALLBACK RenameDialogProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_INITDIALOG: {
+        RenameDialogContext* ctx = reinterpret_cast<RenameDialogContext*>(lParam);
+        SetWindowLongPtrW(hDlg, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(ctx));
+        SetDlgItemTextW(hDlg, IDC_RENAME_FOLDER, ctx->folder.wstring().c_str());
+        RefreshRenamePreview(hDlg, ctx);
+        return TRUE;
+    }
+    case WM_COMMAND: {
+        RenameDialogContext* ctx = reinterpret_cast<RenameDialogContext*>(GetWindowLongPtrW(hDlg, GWLP_USERDATA));
+        if (!ctx) {
+            break;
+        }
+        int id = LOWORD(wParam);
+        int code = HIWORD(wParam);
+        if ((id == IDC_RENAME_PATTERN || id == IDC_RENAME_REPLACE) && code == EN_CHANGE) {
+            RefreshRenamePreview(hDlg, ctx);
+            return TRUE;
+        }
+        if (id == IDC_RENAME_IGNORECASE && code == BN_CLICKED) {
+            RefreshRenamePreview(hDlg, ctx);
+            return TRUE;
+        }
+        if (id == IDC_RENAME_PREVIEW_BTN) {
+            RefreshRenamePreview(hDlg, ctx);
+            return TRUE;
+        }
+        if (id == IDC_RENAME_APPLY_BTN) {
+            ApplyRenamePlan(hDlg, ctx);
+            return TRUE;
+        }
+        if (id == IDCANCEL) {
+            EndDialog(hDlg, 0);
+            return TRUE;
+        }
+        break;
+    }
+    case WM_CLOSE:
+        EndDialog(hDlg, 0);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+void RunRenameMode(HINSTANCE hInstance, int argc, LPWSTR* argv) {
+    std::vector<fs::path> inputFiles;
+    for (int i = 1; i < argc; ++i) {
+        std::wstring arg = ToLowerW(argv[i]);
+        if (arg == L"/mode:rename") {
+            continue;
+        }
+        fs::path p(argv[i]);
+        std::error_code ec;
+        if (fs::is_regular_file(p, ec)) {
+            inputFiles.push_back(p);
+        }
+    }
+    if (inputFiles.empty()) {
+        return;
+    }
+
+    // Aggregate multi-selected files the same way conversion mode does, so a
+    // multi-select in Explorer (one process per file) becomes one dialog.
+    HANDLE collectorMutex = CreateMutexW(nullptr, TRUE, RENAME_COLLECTOR_MUTEX_NAME);
+    if (collectorMutex) {
+        DWORD lastErr = GetLastError();
+        if (lastErr == ERROR_ALREADY_EXISTS) {
+            EnqueueFiles(inputFiles, RENAME_QUEUE_WRITE_MUTEX_NAME, RENAME_QUEUE_FILE_NAME);
+            CloseHandle(collectorMutex);
+            return;
+        }
+
+        EnqueueFiles(inputFiles, RENAME_QUEUE_WRITE_MUTEX_NAME, RENAME_QUEUE_FILE_NAME);
+        Sleep(COLLECT_MS);
+        inputFiles = DrainQueue(RENAME_QUEUE_FILE_NAME, false);
+
+        ReleaseMutex(collectorMutex);
+        CloseHandle(collectorMutex);
+
+        if (inputFiles.empty()) {
+            return;
+        }
+    }
+
+    RenameDialogContext ctx;
+    ctx.folder = inputFiles.front().parent_path();
+
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(ctx.folder, ec)) {
+        if (entry.is_regular_file()) {
+            ctx.files.push_back(entry.path());
+        }
+    }
+    std::sort(ctx.files.begin(), ctx.files.end(), [](const fs::path& a, const fs::path& b) {
+        return ToLowerW(a.filename().wstring()) < ToLowerW(b.filename().wstring());
+    });
+
+    if (ctx.files.empty()) {
+        MessageBoxW(nullptr, L"대상 폴더에 파일이 없습니다.", L"subConverter", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    DialogBoxParamW(hInstance, MAKEINTRESOURCE(IDD_RENAME), nullptr, RenameDialogProc,
+                     reinterpret_cast<LPARAM>(&ctx));
+}
+
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     bool silentMode = false;
     TargetFormat target = TargetFormat::ToSrt;
     DebugLog(L"launch argc=" + std::to_wstring(argc));
+
+    if (argv) {
+        for (int i = 1; i < argc; ++i) {
+            if (ToLowerW(argv[i]) == L"/mode:rename") {
+                RunRenameMode(hInstance, argc, argv);
+                LocalFree(argv);
+                return 0;
+            }
+        }
+    }
 
     if (!argv || argc <= 1) {
         if (!silentMode) {
@@ -2079,15 +2737,15 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     if (collectorMutex) {
         DWORD lastErr = GetLastError();
         if (lastErr == ERROR_ALREADY_EXISTS) {
-            EnqueueFiles(inputFiles);
+            EnqueueFiles(inputFiles, QUEUE_WRITE_MUTEX_NAME, QUEUE_FILE_NAME);
             CloseHandle(collectorMutex);
             LocalFree(argv);
             return 0;
         }
 
-        EnqueueFiles(inputFiles);
+        EnqueueFiles(inputFiles, QUEUE_WRITE_MUTEX_NAME, QUEUE_FILE_NAME);
         Sleep(COLLECT_MS);
-        inputFiles = DrainQueue();
+        inputFiles = DrainQueue(QUEUE_FILE_NAME, true);
 
         ReleaseMutex(collectorMutex);
         CloseHandle(collectorMutex);
