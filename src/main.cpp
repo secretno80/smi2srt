@@ -1246,7 +1246,7 @@ std::string GuessLangFromText(const std::wstring& text) {
 // `lang` (every SRT/ASS caption, and every SMI caption grouped by its raw
 // class value) into a single concrete language code derived from the actual
 // text. Rather than guessing per line, this samples a handful of captions starting around the
-// 5th real line in the group — skipping any short/atypical opening lines —
+// middle of the group — skipping any short/atypical opening lines —
 // and picks the language with the highest character share across that
 // sample, then applies it to every caption in the group. This keeps a
 // single-language source from being fragmented into stray one-line output
@@ -1260,7 +1260,7 @@ void ResolveTextBasedLanguages(std::vector<Caption>& captions) {
     }
 
     for (auto& [groupKey, indices] : pendingGroups) {
-        size_t sampleStart = indices.size() > 4 ? 4 : 0;
+        size_t sampleStart = indices.size() / 2;
 
         std::wstring sample;
         for (size_t k = sampleStart; k < indices.size() && sample.size() < 200; ++k) {
@@ -2051,7 +2051,7 @@ std::wstring TargetExtension(TargetFormat target) {
 }
 
 std::wstring BuildOutputText(TargetFormat target, const std::vector<Caption>& items,
-                              int playResX = 1280, int playResY = 720, int baseFontSize = 24) {
+                              int playResX = 1920, int playResY = 1080, int baseFontSize = 75) {
     if (target == TargetFormat::ToSmi) {
         return BuildSmiText(items);
     }
@@ -2195,16 +2195,16 @@ ConvertResult ConvertSingleFile(const fs::path& inputPath, TargetFormat target) 
     std::wstring outputBaseStem = matchedVideo.empty() ? inputPath.stem().wstring() : matchedVideo.stem().wstring();
     std::wstring outputExt = TargetExtension(target);
 
-    int playResX = 1280;
-    int playResY = 720;
-    int baseFontSize = 24;
+    int playResX = 1920;
+    int playResY = 1080;
+    int baseFontSize = 75;
     if (target == TargetFormat::ToAss && !matchedVideo.empty()) {
         int videoW = 0;
         int videoH = 0;
         if (GetVideoDimensions(matchedVideo, videoW, videoH) && videoW > 0 && videoH > 0) {
             playResX = videoW;
             playResY = videoH;
-            baseFontSize = std::max(10, static_cast<int>(std::lround(24.0 * videoH / 720.0)));
+            baseFontSize = std::max(10, static_cast<int>(std::lround(75.0 * videoH / 1080.0)));
         }
     }
 
