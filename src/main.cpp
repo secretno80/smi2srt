@@ -29,6 +29,7 @@ struct Caption {
     std::wstring text;
     std::wstring rawHtml; // Original HTML from SMI source (empty if not from SMI)
     std::string lang;
+    std::wstring smiClass; // Raw SMI <P Class=...> value (empty if not from SMI)
 };
 
 struct ConvertResult {
@@ -246,8 +247,26 @@ std::wstring ParseColorToAss(const std::wstring& colorStr) {
     s = Trim(s);
     std::wstring lower = ToLowerW(s);
 
+    // Real-world SMI files frequently omit the leading '#' on a hex triplet
+    // (e.g. <font color=CCCCFF>) even though it's technically required CSS —
+    // treat a bare 3/6-digit hex run the same as one prefixed with '#' so
+    // that color isn't silently dropped.
+    std::wstring hexCandidate;
+    bool isHex = false;
     if (!lower.empty() && lower[0] == L'#') {
-        std::wstring hex = lower.substr(1);
+        hexCandidate = lower.substr(1);
+        isHex = true;
+    } else if (lower.size() == 3 || lower.size() == 6) {
+        isHex = std::all_of(lower.begin(), lower.end(), [](wchar_t ch) {
+            return std::iswxdigit(ch) != 0;
+        });
+        if (isHex) {
+            hexCandidate = lower;
+        }
+    }
+
+    if (isHex) {
+        const std::wstring& hex = hexCandidate;
         int r = 0, g = 0, b = 0;
         try {
             if (hex.size() == 6) {
@@ -340,7 +359,7 @@ std::wstring ExtractTagAttr(const std::wstring& tagContent, const std::wstring& 
 // Convert SMI inner-HTML (inside a <p> block) to ASS dialogue text,
 // mapping <b>, <i>, <u>, <s>/<strike>, <font color/size>, and <br> to
 // the corresponding ASS override codes.
-std::wstring SmiHtmlToAssText(const std::wstring& html) {
+std::wstring SmiHtmlToAssText(const std::wstring& html, int baseFontSize) {
     std::wstring out;
     out.reserve(html.size());
     size_t pos = 0;
@@ -444,7 +463,7 @@ std::wstring SmiHtmlToAssText(const std::wstring& html) {
                     --colorOpen;
                 }
                 if (frame.hadSize) {
-                    out += L"{\\fs28}"; // reset to default size
+                    out += L"{\\fs" + std::to_wstring(baseFontSize) + L"}"; // reset to default size
                 }
                 fontStack.pop_back();
             }
@@ -824,7 +843,115 @@ int ExtractEpisode(const std::wstring& stem) {
     return -1;
 }
 
-int ComputeNameScore(const fs::path& subtitlePath, const fs::path& videoPath) {
+// Every run of ASCII digits in the normalized stem, left to right, as
+// integers (e.g. "Show.05.1080p" -> {5, 1080}). Used to infer episode
+// numbers from filenames that carry a bare digit with no S/E/EP marker.
+std::vector<int> ExtractNumberSequence(const std::wstring& stem) {
+    std::wstring normalized = NormalizeNameForMatch(stem);
+    std::vector<int> numbers;
+    static const std::wregex digitsRe(LR"(\d+)");
+    std::wsregex_iterator it(normalized.begin(), normalized.end(), digitsRe);
+    std::wsregex_iterator end;
+    for (; it != end; ++it) {
+        try {
+            numbers.push_back(std::stoi(it->str()));
+        } catch (...) {
+            // Digit run too long to fit an int (essentially never happens
+            // for filenames) — treat as unusable rather than throwing.
+        }
+    }
+    return numbers;
+}
+
+// Case-insensitive, separator-normalized key so paths gathered from two
+// different directory scans (or an argv path vs. a directory_iterator path)
+// compare equal even if their casing or exact string form differs.
+std::wstring PathKey(const fs::path& p) {
+    std::error_code ec;
+    fs::path canon = fs::weakly_canonical(p, ec);
+    return ToLowerW((ec ? p : canon).wstring());
+}
+
+// Given a complete, aligned batch of files that share a common naming
+// template (e.g. every subtitle in one folder, or every video in one
+// folder), tries to find the one numeric "column" in their filenames that
+// encodes the episode number, and returns each file's inferred number.
+//
+// The columns are aligned by position: the k-th digit-run in each filename
+// is compared against the k-th digit-run of every other file. A column
+// qualifies as "the episode number" only if, across every file in the
+// batch, its values are pairwise distinct and form a run of exactly |m|
+// consecutive integers (in any order, at any starting value — episodes 05
+// through 10 qualify just as well as 01 through 06). This intentionally
+// does not require the run to start at 1 or stay within [1, m]: a partial
+// season selected from the middle (e.g. 05~10 out of a 20-episode show)
+// still produces a valid consecutive run, just not one anchored at 1.
+// Resolution/year/bitrate columns are excluded because they hold the same
+// value in every filename (constant, not consecutive) — not because their
+// value is "too large". The left-most qualifying column wins. Returns an
+// empty map if the filenames don't share the same digit-run "shape" or no
+// column qualifies.
+std::map<std::wstring, int> InferBatchEpisodeNumbers(const std::vector<fs::path>& files) {
+    std::map<std::wstring, int> result;
+    size_t m = files.size();
+    if (m < 2) {
+        return result; // nothing to disambiguate against with a single file
+    }
+
+    std::vector<std::vector<int>> perFileNumbers;
+    perFileNumbers.reserve(m);
+    size_t columnCount = SIZE_MAX;
+    for (const auto& f : files) {
+        std::vector<int> nums = ExtractNumberSequence(f.stem().wstring());
+        if (columnCount == SIZE_MAX) {
+            columnCount = nums.size();
+        } else if (nums.size() != columnCount) {
+            return result; // filenames don't share a common numeric "shape"
+        }
+        perFileNumbers.push_back(std::move(nums));
+    }
+    if (columnCount == 0 || columnCount == SIZE_MAX) {
+        return result;
+    }
+
+    for (size_t col = 0; col < columnCount; ++col) {
+        std::vector<int> values;
+        values.reserve(m);
+        for (const auto& nums : perFileNumbers) {
+            values.push_back(nums[col]);
+        }
+
+        std::vector<int> sorted = values;
+        std::sort(sorted.begin(), sorted.end());
+        bool isConsecutiveRun = true;
+        for (size_t i = 1; i < sorted.size(); ++i) {
+            if (sorted[i] != sorted[i - 1] + 1) { isConsecutiveRun = false; break; }
+        }
+        if (!isConsecutiveRun) continue;
+
+        for (size_t i = 0; i < m; ++i) {
+            result[PathKey(files[i])] = values[i];
+        }
+        return result; // first qualifying column wins (left-to-right)
+    }
+
+    return result; // no column looked like an episode-number sequence
+}
+
+// Explicit S/E, EP, or E markers are trusted first; a bare digit run is only
+// used when no marker exists, and only if the batch-wide inference above
+// already resolved this exact file (see BuildBareEpisodeNumberMap).
+int ResolveEpisodeNumber(const fs::path& path, const std::map<std::wstring, int>& bareEpisodes) {
+    int explicitEp = ExtractEpisode(path.stem().wstring());
+    if (explicitEp > 0) {
+        return explicitEp;
+    }
+    auto it = bareEpisodes.find(PathKey(path));
+    return (it != bareEpisodes.end()) ? it->second : -1;
+}
+
+int ComputeNameScore(const fs::path& subtitlePath, const fs::path& videoPath,
+                      const std::map<std::wstring, int>& bareEpisodes) {
     std::wstring subStem = ToLowerW(subtitlePath.stem().wstring());
     std::wstring vidStem = ToLowerW(videoPath.stem().wstring());
     if (subStem == vidStem) {
@@ -839,8 +966,8 @@ int ComputeNameScore(const fs::path& subtitlePath, const fs::path& videoPath) {
         score += (subYear == vidYear) ? 120 : -80;
     }
 
-    int subEp = ExtractEpisode(subtitlePath.stem().wstring());
-    int vidEp = ExtractEpisode(videoPath.stem().wstring());
+    int subEp = ResolveEpisodeNumber(subtitlePath, bareEpisodes);
+    int vidEp = ResolveEpisodeNumber(videoPath, bareEpisodes);
     if (subEp > 0 && vidEp > 0) {
         score += (subEp == vidEp) ? 180 : -120;
     }
@@ -872,7 +999,10 @@ int ComputeNameScore(const fs::path& subtitlePath, const fs::path& videoPath) {
 
 // Returns the path of the video file in the same folder that best matches
 // |subtitlePath|'s name, or an empty path if none/no confident match exists.
-fs::path ResolveMatchedVideoPath(const fs::path& subtitlePath) {
+// |bareEpisodes| is the batch-wide marker-less episode map (see
+// BuildBareEpisodeNumberMap); pass an empty map when it isn't available.
+fs::path ResolveMatchedVideoPath(const fs::path& subtitlePath,
+                                  const std::map<std::wstring, int>& bareEpisodes = {}) {
     std::vector<fs::path> videos;
     try {
         for (const auto& entry : fs::directory_iterator(subtitlePath.parent_path())) {
@@ -900,7 +1030,7 @@ fs::path ResolveMatchedVideoPath(const fs::path& subtitlePath) {
     fs::path bestPath;
 
     for (const auto& video : videos) {
-        int score = ComputeNameScore(subtitlePath, video);
+        int score = ComputeNameScore(subtitlePath, video, bareEpisodes);
         if (score > bestScore) {
             secondScore = bestScore;
             bestScore = score;
@@ -920,6 +1050,53 @@ fs::path ResolveMatchedVideoPath(const fs::path& subtitlePath) {
 std::wstring ResolveMatchedVideoStem(const fs::path& subtitlePath) {
     fs::path matched = ResolveMatchedVideoPath(subtitlePath);
     return matched.empty() ? subtitlePath.stem().wstring() : matched.stem().wstring();
+}
+
+// Builds the batch-wide marker-less episode map used as a ComputeNameScore()
+// fallback for filenames with a bare episode digit and no S/E/EP marker
+// (e.g. "쇼 - 05.mkv" matched against "쇼.05.smi").
+//
+// |batchFiles| is the whole multi-select batch (already aggregated by the
+// collector), grouped here by parent directory. For each directory:
+//  - Subtitles: only inferred when the batch accounts for *every* subtitle
+//    in that directory — inferring on a partial selection would make the
+//    "numbers form one consecutive run" assumption misfire (e.g. selecting
+//    episodes 3 and 4 out of 10 looks like a run of length 2, not 10).
+//  - Videos: inferred unconditionally from whatever videos exist there,
+//    independent of the subtitle batch size (n:n / n:m are both fine).
+std::map<std::wstring, int> BuildBareEpisodeNumberMap(const std::vector<fs::path>& batchFiles) {
+    std::map<std::wstring, int> result;
+
+    std::map<fs::path, std::vector<fs::path>> selectedSubsByDir;
+    for (const auto& f : batchFiles) {
+        selectedSubsByDir[f.parent_path()].push_back(f);
+    }
+
+    for (const auto& [dir, selectedSubs] : selectedSubsByDir) {
+        std::vector<fs::path> allSubsInDir;
+        std::vector<fs::path> allVideosInDir;
+        std::error_code ec;
+        for (const auto& entry : fs::directory_iterator(dir, ec)) {
+            if (!entry.is_regular_file()) continue;
+            fs::path p = entry.path();
+            if (IsSubtitleExtension(p.extension().wstring())) {
+                allSubsInDir.push_back(p);
+            } else if (IsVideoExtension(p.extension())) {
+                allVideosInDir.push_back(p);
+            }
+        }
+        if (ec) continue;
+
+        if (selectedSubs.size() == allSubsInDir.size()) {
+            auto subEpisodes = InferBatchEpisodeNumbers(allSubsInDir);
+            result.insert(subEpisodes.begin(), subEpisodes.end());
+        }
+
+        auto videoEpisodes = InferBatchEpisodeNumbers(allVideosInDir);
+        result.insert(videoEpisodes.begin(), videoEpisodes.end());
+    }
+
+    return result;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1344,14 +1521,14 @@ std::vector<Caption> ParseSmiCaptions(const std::wstring& content) {
             std::wstring normalizedClass = ToLowerW(cls);
             std::string lang = kPendingLangMarker + std::string(normalizedClass.begin(), normalizedClass.end());
 
-            parsed.push_back({startMs, inferredEndMs, text, innerHtml, lang});
+            parsed.push_back({startMs, inferredEndMs, text, innerHtml, lang, normalizedClass});
             addedAny = true;
         }
 
         if (!addedAny) {
             std::wstring text = NormalizeSubtitleText(block);
             if (!text.empty()) {
-                parsed.push_back({startMs, inferredEndMs, text, block, kPendingLangMarker});
+                parsed.push_back({startMs, inferredEndMs, text, block, kPendingLangMarker, L""});
             }
         }
     }
@@ -1380,7 +1557,7 @@ std::vector<Caption> ParseSrtCaptions(const std::wstring& content) {
         if (startMs < 0 || endMs <= startMs || text.empty()) {
             continue;
         }
-        parsed.push_back({startMs, endMs, text, L"", kPendingLangMarker});
+        parsed.push_back({startMs, endMs, text, L"", kPendingLangMarker, L""});
     }
 
     std::sort(parsed.begin(), parsed.end(), [](const Caption& left, const Caption& right) {
@@ -1462,7 +1639,7 @@ std::vector<Caption> ParseAssCaptions(const std::wstring& content) {
             continue;
         }
 
-        parsed.push_back({startMs, endMs, text, L"", kPendingLangMarker});
+        parsed.push_back({startMs, endMs, text, L"", kPendingLangMarker, L""});
     }
 
     std::sort(parsed.begin(), parsed.end(), [](const Caption& left, const Caption& right) {
@@ -1531,8 +1708,6 @@ std::wstring BuildSmiText(const std::vector<Caption>& items) {
 // ASS style optimisation helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-static constexpr int kAssDefaultFontSize = 50;
-
 // Represents the set of formatting properties that can be expressed as a
 // named [V4+ Styles] entry.
 struct StyleDef {
@@ -1573,9 +1748,18 @@ std::wstring StyleDefToInlineCodes(const StyleDef& s) {
     return codes;
 }
 
+// "Arial" has no Hangul glyphs, so an ASS renderer (libass, VSFilter, ...)
+// silently substitutes some arbitrary fallback font for Korean text — which
+// can look nothing like whatever font the source SMI was actually previewed
+// with. Malgun Gothic ships with every Windows install since Vista, has full
+// Hangul coverage, and is the OS's own default Korean UI font, so it's a much
+// safer default than a Latin-only font for output that's overwhelmingly
+// Korean-subtitle content.
+const wchar_t* const kAssFontName = L"맑은 고딕";
+
 // Build the [V4+ Styles] "Style: ..." line for a named style.
-std::wstring StyleDefToAssStyleLine(const std::wstring& name, const StyleDef& s) {
-    int fontSize = (s.fontSize > 0) ? s.fontSize : kAssDefaultFontSize;
+std::wstring StyleDefToAssStyleLine(const std::wstring& name, const StyleDef& s, int baseFontSize) {
+    int fontSize = (s.fontSize > 0) ? s.fontSize : baseFontSize;
 
     // s.color is &HBBGGRR& (9 chars); style field needs &H00BBGGRR (10 chars).
     std::wstring primaryColor = L"&H00FFFFFF";
@@ -1584,7 +1768,7 @@ std::wstring StyleDefToAssStyleLine(const std::wstring& name, const StyleDef& s)
     }
 
     return L"Style: " + name +
-           L",Arial," + std::to_wstring(fontSize) + L"," +
+           L"," + kAssFontName + L"," + std::to_wstring(fontSize) + L"," +
            primaryColor + L",&H000000FF,&H00000000,&H64000000," +
            (s.bold      ? L"1" : L"0") + L"," +
            (s.italic    ? L"1" : L"0") + L"," +
@@ -1628,8 +1812,8 @@ std::wstring StyleDefToName(const StyleDef& s) {
 // Strip ASS override blocks at the END of a dialogue text that merely reset
 // formatting to defaults.  Because each ASS Dialogue event resets style to
 // its named style automatically, these trailing resets are redundant.
-std::wstring StripTrailingAssResets(const std::wstring& text) {
-    const std::wstring fsReset = L"{\\fs" + std::to_wstring(kAssDefaultFontSize) + L"}";
+std::wstring StripTrailingAssResets(const std::wstring& text, int baseFontSize) {
+    const std::wstring fsReset = L"{\\fs" + std::to_wstring(baseFontSize) + L"}";
 
     std::wstring out = text;
     bool changed = true;
@@ -1656,7 +1840,7 @@ std::wstring StripTrailingAssResets(const std::wstring& text) {
 //   {\c&H00FFFFFF&}\N{\i1}{\c&HEBCE87&}  →  \N{\i1}{\c&HEBCE87&}
 //   {\i0}\N{\i1}                         →  \N{\i1}
 // Applied iteratively until stable.
-std::wstring OptimizeAssInlineCodes(std::wstring text) {
+std::wstring OptimizeAssInlineCodes(std::wstring text, int baseFontSize) {
     // (?:\N|\{[^}]*\})* matches sequences of line-break or any override block
     static const std::wregex colorReset(
         LR"(\{\\c&H00FFFFFF&\}((?:\\N|\{[^}]*\})*)(\{\\c[^}]+\}))",
@@ -1669,8 +1853,10 @@ std::wstring OptimizeAssInlineCodes(std::wstring text) {
         LR"(\{\\u0\}((?:\\N|\{[^}]*\})*)(\{\\u1\}))");
     static const std::wregex strikeReset(
         LR"(\{\\s0\}((?:\\N|\{[^}]*\})*)(\{\\s1\}))");
-    static const std::wregex fsReset(
-        std::wstring(LR"(\{\\fs)") + std::to_wstring(kAssDefaultFontSize) +
+    // Depends on baseFontSize (varies per matched video resolution), so unlike
+    // the patterns above this one can't be a compile-time constant.
+    const std::wregex fsReset(
+        std::wstring(LR"(\{\\fs)") + std::to_wstring(baseFontSize) +
         LR"(\}((?:\\N|\{[^}]*\})*)(\{\\fs\d+\}))");
 
     const std::wregex* patterns[] = {
@@ -1689,7 +1875,7 @@ std::wstring OptimizeAssInlineCodes(std::wstring text) {
     return text;
 }
 
-bool ApplyAssOverrideToStyle(const std::wstring& inner, StyleDef& style) {
+bool ApplyAssOverrideToStyle(const std::wstring& inner, StyleDef& style, int baseFontSize) {
     if (inner == L"\\b1") {
         style.bold = true;
         return true;
@@ -1738,7 +1924,7 @@ bool ApplyAssOverrideToStyle(const std::wstring& inner, StyleDef& style) {
     if (inner.rfind(L"\\fs", 0) == 0 && inner.size() > 3) {
         try {
             int fontSize = std::stoi(inner.substr(3));
-            style.fontSize = (fontSize == kAssDefaultFontSize) ? 0 : fontSize;
+            style.fontSize = (fontSize == baseFontSize) ? 0 : fontSize;
             return true;
         } catch (...) {
             return false;
@@ -1761,7 +1947,7 @@ bool HasVisibleTextBeforeNextOverride(const std::wstring& text, size_t pos) {
     return false;
 }
 
-void CollectStyleRunsFromAssText(const std::wstring& text, std::map<StyleDef, int>& styleCounts) {
+void CollectStyleRunsFromAssText(const std::wstring& text, std::map<StyleDef, int>& styleCounts, int baseFontSize) {
     StyleDef currentStyle;
     size_t pos = 0;
 
@@ -1788,7 +1974,7 @@ void CollectStyleRunsFromAssText(const std::wstring& text, std::map<StyleDef, in
             }
 
             std::wstring inner = text.substr(pos + 1, close - pos - 1);
-            if (ApplyAssOverrideToStyle(inner, nextStyle)) {
+            if (ApplyAssOverrideToStyle(inner, nextStyle, baseFontSize)) {
                 recognizedAny = true;
             } else {
                 allRecognized = false;
@@ -1809,7 +1995,8 @@ void CollectStyleRunsFromAssText(const std::wstring& text, std::map<StyleDef, in
 
 std::wstring RewriteAssTextWithNamedStyles(
     const std::wstring& text,
-    const std::map<StyleDef, std::wstring>& styleNames) {
+    const std::map<StyleDef, std::wstring>& styleNames,
+    int baseFontSize) {
 
     std::wstring out;
     out.reserve(text.size());
@@ -1845,7 +2032,7 @@ std::wstring RewriteAssTextWithNamedStyles(
 
             rawBlocks += text.substr(pos, close - pos + 1);
             std::wstring inner = text.substr(pos + 1, close - pos - 1);
-            if (ApplyAssOverrideToStyle(inner, nextStyle)) {
+            if (ApplyAssOverrideToStyle(inner, nextStyle, baseFontSize)) {
                 recognizedAny = true;
             } else {
                 allRecognized = false;
@@ -1920,7 +2107,114 @@ bool TryExtractUniformStyle(const std::wstring& text,
     return true;
 }
 
-std::wstring BuildAssText(const std::vector<Caption>& items, int playResX, int playResY, int baseFontSize) {
+// ─────────────────────────────────────────────────────────────────────────────
+// SMI <STYLE> CSS font-weight → ASS bold mapping.
+// SAMI files commonly declare default/per-track boldness via CSS instead of
+// (or in addition to) inline <b> tags, e.g.:
+//   P { font-weight:normal; ... }
+//   .ENCC { font-weight:bold; }
+// These rules never appear as inline tags in the caption body, so without
+// reading the <STYLE> block a track declared bold only via CSS would render
+// as regular weight in the converted ASS. ParseSmiCssBoldRules extracts the
+// bold/normal verdict per class selector (".KRCC", ".ENCC", ...) and for the
+// bare "P" element selector (used as the file-wide default).
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct SmiCssBoldRules {
+    bool hasDefaultBold = false;
+    bool defaultBold = false;
+    std::map<std::wstring, bool> classBold; // lowercase class name -> bold
+};
+
+// Interprets a CSS font-weight value ("bold", "normal", "bolder", "lighter",
+// or a numeric weight 100-900) as a bold/not-bold verdict. Returns false via
+// outBold and false as the return value if the value isn't recognized.
+bool InterpretFontWeightValue(const std::wstring& rawValue, bool& outBold) {
+    std::wstring value = ToLowerW(Trim(rawValue));
+    if (value == L"bold" || value == L"bolder") {
+        outBold = true;
+        return true;
+    }
+    if (value == L"normal" || value == L"lighter") {
+        outBold = false;
+        return true;
+    }
+    try {
+        size_t consumed = 0;
+        int weight = std::stoi(value, &consumed);
+        if (consumed == value.size()) {
+            outBold = (weight >= 600);
+            return true;
+        }
+    } catch (...) {}
+    return false;
+}
+
+SmiCssBoldRules ParseSmiCssBoldRules(const std::wstring& content) {
+    SmiCssBoldRules rules;
+
+    std::wregex styleBlockRe(LR"(<style[^>]*>([\s\S]*?)</style>)", std::regex_constants::icase);
+    std::wsmatch styleMatch;
+    if (!std::regex_search(content, styleMatch, styleBlockRe)) {
+        return rules;
+    }
+    std::wstring css = styleMatch[1].str();
+    // SAMI wraps its CSS in an HTML comment (<!-- ... -->) so non-CSS-aware
+    // renderers ignore it; strip the markers so they don't get absorbed into
+    // the first rule's selector (e.g. "<!--\nP" failing to match "p").
+    css = std::regex_replace(css, std::wregex(LR"(<!--|-->)"), L"");
+
+    std::wregex ruleRe(LR"(([^{}]+)\{([^}]*)\})");
+    std::wsregex_iterator it(css.begin(), css.end(), ruleRe);
+    std::wsregex_iterator end;
+    std::wregex fontWeightRe(LR"(font-weight\s*:\s*([a-z0-9]+))", std::regex_constants::icase);
+
+    for (; it != end; ++it) {
+        std::wstring body = (*it)[2].str();
+        std::wsmatch fwMatch;
+        if (!std::regex_search(body, fwMatch, fontWeightRe)) {
+            continue;
+        }
+        bool isBold = false;
+        if (!InterpretFontWeightValue(fwMatch[1].str(), isBold)) {
+            continue;
+        }
+
+        std::wstring selectorPart = (*it)[1].str();
+        std::wstringstream selStream(selectorPart);
+        std::wstring selector;
+        while (std::getline(selStream, selector, L',')) {
+            std::wstring sel = ToLowerW(Trim(selector));
+            if (sel.empty()) {
+                continue;
+            }
+            if (sel[0] == L'.') {
+                rules.classBold[sel.substr(1)] = isBold;
+            } else if (sel == L"p") {
+                rules.hasDefaultBold = true;
+                rules.defaultBold = isBold;
+            }
+        }
+    }
+
+    return rules;
+}
+
+// Resolves whether a caption should render bold by default per the SMI's CSS,
+// preferring its own class's rule and falling back to the file-wide "P"
+// default when the class has no explicit font-weight declared.
+bool ResolveCssBold(const std::wstring& smiClass, const SmiCssBoldRules& rules) {
+    if (!smiClass.empty()) {
+        auto it = rules.classBold.find(ToLowerW(Trim(smiClass)));
+        if (it != rules.classBold.end()) {
+            return it->second;
+        }
+    }
+    return rules.hasDefaultBold && rules.defaultBold;
+}
+
+std::wstring BuildAssText(const std::vector<Caption>& items, int playResX, int playResY, int baseFontSize,
+                           const SmiCssBoldRules& cssBoldRules = SmiCssBoldRules{}) {
     // ── Pass 1: generate per-item ASS text and detect uniform styles ──────────
     struct ItemInfo {
         std::wstring assText;      // dialogue text after local optimization
@@ -1938,7 +2232,7 @@ std::wstring BuildAssText(const std::vector<Caption>& items, int playResX, int p
         std::wstring raw;
 
         if (!item.rawHtml.empty()) {
-            raw = SmiHtmlToAssText(item.rawHtml);
+            raw = SmiHtmlToAssText(item.rawHtml, baseFontSize);
         } else {
             raw = item.text;
             size_t p = 0;
@@ -1948,9 +2242,18 @@ std::wstring BuildAssText(const std::vector<Caption>& items, int playResX, int p
             }
         }
 
-        raw = StripTrailingAssResets(raw);
-        raw = OptimizeAssInlineCodes(raw);
-        CollectStyleRunsFromAssText(raw, styleCounts);
+        // A caption whose SMI class (or the file-wide "P" selector) declares
+        // font-weight:bold in CSS never carries an inline <b> tag for it —
+        // the bold-ness only exists in the <STYLE> block. Prepend the same
+        // override an explicit <b> would have produced so it flows through
+        // the existing style-detection/dedup logic below unchanged.
+        if (ResolveCssBold(item.smiClass, cssBoldRules)) {
+            raw = L"{\\b1}" + raw;
+        }
+
+        raw = StripTrailingAssResets(raw, baseFontSize);
+        raw = OptimizeAssInlineCodes(raw, baseFontSize);
+        CollectStyleRunsFromAssText(raw, styleCounts, baseFontSize);
 
         StyleDef s;
         std::wstring stripped;
@@ -2002,7 +2305,7 @@ std::wstring BuildAssText(const std::vector<Caption>& items, int playResX, int p
     ass += L"ScaledBorderAndShadow: yes\r\n\r\n";
     ass += L"[V4+ Styles]\r\n";
     ass += L"Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\r\n";
-    ass += L"Style: Default,Arial," + std::to_wstring(baseFontSize) +
+    ass += L"Style: Default," + std::wstring(kAssFontName) + L"," + std::to_wstring(baseFontSize) +
            L",&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,2,1,2,20,20,20,0\r\n";
 
     // Named styles sorted alphabetically for deterministic output
@@ -2012,7 +2315,7 @@ std::wstring BuildAssText(const std::vector<Caption>& items, int playResX, int p
     std::sort(sortedStyles.begin(), sortedStyles.end(),
               [](const auto& a, const auto& b) { return a.first < b.first; });
     for (const auto& [name, s] : sortedStyles) {
-        ass += StyleDefToAssStyleLine(name, s);
+        ass += StyleDefToAssStyleLine(name, s, baseFontSize);
     }
 
     ass += L"\r\n[Events]\r\n";
@@ -2035,7 +2338,7 @@ std::wstring BuildAssText(const std::vector<Caption>& items, int playResX, int p
                 text = StyleDefToInlineCodes(infos[i].style) + text;
             }
         } else {
-            text = RewriteAssTextWithNamedStyles(text, styleNames);
+            text = RewriteAssTextWithNamedStyles(text, styleNames, baseFontSize);
         }
 
         ass += L"Dialogue: 0," + FormatTimestampAss(startMs) + L"," + FormatTimestampAss(endMs) +
@@ -2050,13 +2353,30 @@ std::wstring TargetExtension(TargetFormat target) {
     return L".srt";
 }
 
+// Strips a trailing recognized language-code segment (".ko"/".en"/".jp", any
+// case; loops to catch more than one stacked) from a stem before the
+// newly-detected language tag is appended, so re-converting an
+// already-tagged file (e.g. "Show.ko.smi") doesn't produce "Show.ko.ko.srt".
+std::wstring StripKnownLanguageSuffix(std::wstring stem) {
+    static const std::set<std::wstring> knownLangCodes = {L"ko", L"en", L"jp"};
+    while (true) {
+        size_t dot = stem.rfind(L'.');
+        if (dot == std::wstring::npos) break;
+        std::wstring suffix = ToLowerW(stem.substr(dot + 1));
+        if (knownLangCodes.find(suffix) == knownLangCodes.end()) break;
+        stem = stem.substr(0, dot);
+    }
+    return stem;
+}
+
 std::wstring BuildOutputText(TargetFormat target, const std::vector<Caption>& items,
-                              int playResX = 1920, int playResY = 1080, int baseFontSize = 75) {
+                              int playResX = 1920, int playResY = 1080, int baseFontSize = 75,
+                              const SmiCssBoldRules& cssBoldRules = SmiCssBoldRules{}) {
     if (target == TargetFormat::ToSmi) {
         return BuildSmiText(items);
     }
     if (target == TargetFormat::ToAss) {
-        return BuildAssText(items, playResX, playResY, baseFontSize);
+        return BuildAssText(items, playResX, playResY, baseFontSize, cssBoldRules);
     }
     return BuildSrtText(items);
 }
@@ -2129,7 +2449,256 @@ bool WriteUtf8File(const fs::path& outPath, const std::wstring& content) {
     return true;
 }
 
-ConvertResult ConvertSingleFile(const fs::path& inputPath, TargetFormat target) {
+// ─────────────────────────────────────────────────────────────────────────────
+// Same-format conversion (e.g. .smi -> .smi). Unlike cross-format conversion,
+// which parses into Captions and rebuilds the file (normalizing formatting,
+// reclassing SMI tracks, and splitting multi-language sources into separate
+// files), a same-format run must leave every surviving byte of the source
+// exactly as-is. The only two changes allowed are the rule-based removal of
+// leading/trailing credit captions and the output filename. These helpers
+// therefore locate each caption's raw span in the original text and excise
+// only the spans identified as credits, leaving everything else untouched.
+// ─────────────────────────────────────────────────────────────────────────────
+
+std::wstring ExciseSpans(const std::wstring& content, std::vector<std::pair<size_t, size_t>> spans) {
+    if (spans.empty()) {
+        return content;
+    }
+    std::sort(spans.begin(), spans.end());
+
+    std::wstring out;
+    out.reserve(content.size());
+    size_t cursor = 0;
+    for (const auto& span : spans) {
+        size_t start = std::max(span.first, cursor);
+        size_t end = std::max(span.second, cursor);
+        if (start > cursor) {
+            out.append(content, cursor, start - cursor);
+        }
+        cursor = std::max(cursor, end);
+    }
+    if (cursor < content.size()) {
+        out.append(content, cursor, content.size() - cursor);
+    }
+    return out;
+}
+
+std::wstring RemoveSrtCreditsRaw(const std::wstring& content) {
+    struct Item { size_t start; size_t end; std::wstring text; };
+    std::vector<Item> items;
+
+    std::wregex blockRegex(
+        LR"((?:^|\r?\n)\s*\d+\s*\r?\n\s*(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})\s*\r?\n([\s\S]*?)(?=\r?\n\s*\r?\n|$))",
+        std::regex_constants::icase);
+
+    std::wsregex_iterator it(content.begin(), content.end(), blockRegex);
+    std::wsregex_iterator end;
+    for (; it != end; ++it) {
+        std::wstring text = NormalizePlainSubtitleText((*it)[3].str());
+        if (text.empty()) {
+            continue;
+        }
+        items.push_back({static_cast<size_t>(it->position(0)),
+                          static_cast<size_t>(it->position(0) + it->length(0)),
+                          text});
+    }
+
+    size_t begin = 0;
+    while (begin < items.size() && IsCreatorCreditCaption(items[begin].text)) {
+        ++begin;
+    }
+    size_t last = items.size();
+    while (last > begin && IsCreatorCreditCaption(items[last - 1].text)) {
+        --last;
+    }
+
+    std::vector<std::pair<size_t, size_t>> spans;
+    for (size_t i = 0; i < begin; ++i) spans.push_back({items[i].start, items[i].end});
+    for (size_t i = last; i < items.size(); ++i) spans.push_back({items[i].start, items[i].end});
+
+    return ExciseSpans(content, spans);
+}
+
+std::wstring RemoveAssCreditsRaw(const std::wstring& content) {
+    struct Item { size_t start; size_t end; std::wstring text; };
+    std::vector<Item> items;
+
+    bool inEvents = false;
+    std::vector<std::wstring> formatFields;
+    size_t pos = 0;
+
+    while (pos <= content.size()) {
+        size_t nl = content.find(L'\n', pos);
+        size_t lineTextEnd = (nl == std::wstring::npos) ? content.size() : nl;
+        size_t nextPos = (nl == std::wstring::npos) ? content.size() : nl + 1;
+
+        std::wstring line = content.substr(pos, lineTextEnd - pos);
+        if (!line.empty() && line.back() == L'\r') {
+            line.pop_back();
+        }
+        std::wstring lowered = ToLowerW(Trim(line));
+
+        if (lowered == L"[events]") {
+            inEvents = true;
+        } else if (inEvents && !lowered.empty() && lowered.front() == L'[') {
+            inEvents = false;
+        } else if (inEvents && lowered.rfind(L"format:", 0) == 0) {
+            std::wstring fieldSpec = Trim(line.substr(7));
+            formatFields = SplitAssCsv(fieldSpec, 64);
+            for (auto& field : formatFields) {
+                field = ToLowerW(Trim(field));
+            }
+        } else if (inEvents && lowered.rfind(L"dialogue:", 0) == 0) {
+            std::wstring payload = line.substr(9);
+            size_t expected = formatFields.empty() ? 10 : formatFields.size();
+            std::vector<std::wstring> fields = SplitAssCsv(payload, expected);
+
+            int textIdx = -1;
+            if (formatFields.empty()) {
+                textIdx = 9;
+            } else {
+                for (size_t i = 0; i < formatFields.size(); ++i) {
+                    if (formatFields[i] == L"text") { textIdx = static_cast<int>(i); break; }
+                }
+            }
+
+            if (fields.size() >= expected && expected > 0 &&
+                textIdx >= 0 && static_cast<size_t>(textIdx) < fields.size()) {
+                std::wstring text = StripAssOverrides(fields[static_cast<size_t>(textIdx)]);
+                if (!text.empty()) {
+                    items.push_back({pos, nextPos, text});
+                }
+            }
+        }
+
+        if (nl == std::wstring::npos) {
+            break;
+        }
+        pos = nextPos;
+    }
+
+    size_t begin = 0;
+    while (begin < items.size() && IsCreatorCreditCaption(items[begin].text)) {
+        ++begin;
+    }
+    size_t last = items.size();
+    while (last > begin && IsCreatorCreditCaption(items[last - 1].text)) {
+        --last;
+    }
+
+    std::vector<std::pair<size_t, size_t>> spans;
+    for (size_t i = 0; i < begin; ++i) spans.push_back({items[i].start, items[i].end});
+    for (size_t i = last; i < items.size(); ++i) spans.push_back({items[i].start, items[i].end});
+
+    return ExciseSpans(content, spans);
+}
+
+std::wstring RemoveSmiCreditsRaw(const std::wstring& content) {
+    struct Item { size_t start; size_t end; std::wstring text; size_t blockIndex; };
+    struct Block { size_t tagStart; size_t tagEnd; };
+
+    std::vector<Item> items;
+    std::vector<Block> blocks;
+
+    std::wregex syncRegex(LR"(<sync[^>]*start\s*=\s*(\d+)[^>]*>)", std::regex_constants::icase);
+    std::wsregex_iterator sBegin(content.begin(), content.end(), syncRegex);
+    std::wsregex_iterator sEnd;
+
+    std::vector<std::pair<size_t, size_t>> syncTagSpans; // [tagStart, tagEnd)
+    for (auto it = sBegin; it != sEnd; ++it) {
+        syncTagSpans.push_back({static_cast<size_t>(it->position(0)),
+                                 static_cast<size_t>(it->position(0) + it->length(0))});
+    }
+
+    std::wregex pRegex(LR"(<p[^>]*class\s*=\s*["']?([^"'\s>]+)[^>]*>([\s\S]*?)(?=(<p[^>]*>|$)))", std::regex_constants::icase);
+
+    // The final <SYNC> block's content run extends to end-of-file, so its
+    // last <P> match (via the "(<p...>|$)" lookahead) would otherwise swallow
+    // the mandatory trailing </BODY></SAMI> markup into the caption's raw
+    // span. Since that markup is structural (not caption content), never let
+    // a caption's raw span extend past the first closing </BODY> or </SAMI>
+    // tag it contains.
+    static const std::wregex closingTagRegex(LR"(</\s*(body|sami)\b[^>]*>)", std::regex_constants::icase);
+    auto clampBeforeClosingTag = [&](size_t start, size_t end) -> size_t {
+        std::wsmatch m;
+        std::wstring segment = content.substr(start, end - start);
+        if (std::regex_search(segment, m, closingTagRegex)) {
+            return start + static_cast<size_t>(m.position(0));
+        }
+        return end;
+    };
+
+    for (size_t i = 0; i < syncTagSpans.size(); ++i) {
+        size_t tagStart = syncTagSpans[i].first;
+        size_t tagEnd = syncTagSpans[i].second;
+        size_t blockContentEnd = (i + 1 < syncTagSpans.size()) ? syncTagSpans[i + 1].first : content.size();
+
+        size_t blockIndex = blocks.size();
+        blocks.push_back({tagStart, tagEnd});
+
+        std::wstring block = content.substr(tagEnd, blockContentEnd - tagEnd);
+        std::wsregex_iterator pBegin(block.begin(), block.end(), pRegex);
+        std::wsregex_iterator pEnd;
+
+        bool addedAny = false;
+        for (auto pit = pBegin; pit != pEnd; ++pit) {
+            std::wstring innerHtml = (*pit)[2].str();
+            std::wstring text = NormalizeSubtitleText(innerHtml);
+            if (text.empty()) {
+                continue;
+            }
+            size_t itemStart = tagEnd + static_cast<size_t>(pit->position(0));
+            size_t itemEnd = clampBeforeClosingTag(itemStart, tagEnd + static_cast<size_t>(pit->position(0) + pit->length(0)));
+            items.push_back({itemStart, itemEnd, text, blockIndex});
+            addedAny = true;
+        }
+
+        if (!addedAny) {
+            std::wstring text = NormalizeSubtitleText(block);
+            if (!text.empty()) {
+                items.push_back({tagEnd, clampBeforeClosingTag(tagEnd, blockContentEnd), text, blockIndex});
+            }
+        }
+    }
+
+    size_t begin = 0;
+    while (begin < items.size() && IsCreatorCreditCaption(items[begin].text)) {
+        ++begin;
+    }
+    size_t last = items.size();
+    while (last > begin && IsCreatorCreditCaption(items[last - 1].text)) {
+        --last;
+    }
+
+    std::set<size_t> removedItemIndices;
+    for (size_t i = 0; i < begin; ++i) removedItemIndices.insert(i);
+    for (size_t i = last; i < items.size(); ++i) removedItemIndices.insert(i);
+
+    std::map<size_t, int> totalItemsInBlock;
+    std::map<size_t, int> removedItemsInBlock;
+    for (size_t i = 0; i < items.size(); ++i) {
+        ++totalItemsInBlock[items[i].blockIndex];
+        if (removedItemIndices.count(i)) {
+            ++removedItemsInBlock[items[i].blockIndex];
+        }
+    }
+
+    std::vector<std::pair<size_t, size_t>> spans;
+    for (size_t i : removedItemIndices) {
+        spans.push_back({items[i].start, items[i].end});
+    }
+    for (const auto& [blockIdx, total] : totalItemsInBlock) {
+        auto foundIt = removedItemsInBlock.find(blockIdx);
+        if (foundIt != removedItemsInBlock.end() && foundIt->second == total) {
+            spans.push_back({blocks[blockIdx].tagStart, blocks[blockIdx].tagEnd});
+        }
+    }
+
+    return ExciseSpans(content, spans);
+}
+
+ConvertResult ConvertSingleFile(const fs::path& inputPath, TargetFormat target,
+                                 const std::map<std::wstring, int>& bareEpisodes) {
     std::wstring ioPath = ToLongPath(inputPath.wstring());
 
     HANDLE in = CreateFileW(
@@ -2174,6 +2743,47 @@ ConvertResult ConvertSingleFile(const fs::path& inputPath, TargetFormat target) 
     }
 
     std::wstring inputExt = ToLowerW(inputPath.extension().wstring());
+    std::wstring outputExt = TargetExtension(target);
+
+    // Same-format conversion (e.g. .smi -> .smi): only remove rule-based
+    // credit captions and rename the file — everything else in the source
+    // must survive byte-for-byte, so this bypasses the normalize/rebuild
+    // pipeline used below for cross-format conversion.
+    if (inputExt == outputExt) {
+        std::vector<Caption> probe = ParseCaptionsByExtension(inputExt, content);
+        if (probe.empty()) {
+            return {false, L"변환 가능한 자막 구간을 찾지 못했습니다."};
+        }
+
+        std::wstring newContent;
+        if (inputExt == L".smi") {
+            newContent = RemoveSmiCreditsRaw(content);
+        } else if (inputExt == L".srt") {
+            newContent = RemoveSrtCreditsRaw(content);
+        } else if (inputExt == L".ass") {
+            newContent = RemoveAssCreditsRaw(content);
+        } else {
+            newContent = content;
+        }
+
+        std::vector<Caption> remaining = ParseCaptionsByExtension(inputExt, newContent);
+        if (remaining.empty()) {
+            return {false, L"크레딧(제작자 정보) 제거 후 변환 가능한 자막이 없습니다."};
+        }
+
+        fs::path matchedVideo = ResolveMatchedVideoPath(inputPath, bareEpisodes);
+        std::wstring outputBaseStem = matchedVideo.empty() ? inputPath.stem().wstring() : matchedVideo.stem().wstring();
+        outputBaseStem = StripKnownLanguageSuffix(outputBaseStem);
+
+        fs::path out = inputPath.parent_path() / (outputBaseStem + outputExt);
+        out = EnsureUniqueOutputPath(out);
+
+        if (!WriteUtf8File(out, newContent)) {
+            return {false, L"변환 파일 저장에 실패했습니다."};
+        }
+        return {true, L""};
+    }
+
     std::vector<Caption> captions = ParseCaptionsByExtension(inputExt, content);
     if (captions.empty()) {
         return {false, L"변환 가능한 자막 구간을 찾지 못했습니다."};
@@ -2191,9 +2801,9 @@ ConvertResult ConvertSingleFile(const fs::path& inputPath, TargetFormat target) 
         byLang[lang].push_back(caption);
     }
 
-    fs::path matchedVideo = ResolveMatchedVideoPath(inputPath);
+    fs::path matchedVideo = ResolveMatchedVideoPath(inputPath, bareEpisodes);
     std::wstring outputBaseStem = matchedVideo.empty() ? inputPath.stem().wstring() : matchedVideo.stem().wstring();
-    std::wstring outputExt = TargetExtension(target);
+    outputBaseStem = StripKnownLanguageSuffix(outputBaseStem);
 
     int playResX = 1920;
     int playResY = 1080;
@@ -2208,6 +2818,15 @@ ConvertResult ConvertSingleFile(const fs::path& inputPath, TargetFormat target) 
         }
     }
 
+    // SMI's font-weight often lives only in the <STYLE> CSS block (per class
+    // or as a file-wide "P" default) rather than as inline <b> tags, so it
+    // has to be read from the source once up front and threaded into the
+    // ASS build for every language group below.
+    SmiCssBoldRules cssBoldRules;
+    if (inputExt == L".smi" && target == TargetFormat::ToAss) {
+        cssBoldRules = ParseSmiCssBoldRules(content);
+    }
+
     for (auto& pair : byLang) {
         auto& items = pair.second;
         if (items.empty()) {
@@ -2217,7 +2836,7 @@ ConvertResult ConvertSingleFile(const fs::path& inputPath, TargetFormat target) 
             return left.startMs < right.startMs;
         });
 
-        std::wstring outText = BuildOutputText(target, items, playResX, playResY, baseFontSize);
+        std::wstring outText = BuildOutputText(target, items, playResX, playResY, baseFontSize, cssBoldRules);
 
         fs::path out = inputPath.parent_path() / outputBaseStem;
         if (pair.first != "und") {
@@ -2284,20 +2903,28 @@ void DebugLog(const std::wstring& message) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Multi-instance file queue
 // Explorer launches one process per file when registered with %1.
-// The first process becomes the "collector": it waits briefly (COLLECT_MS) while
-// the other instances each enqueue their file path into a shared temp directory,
-// then exits immediately.  The collector drains the queue and processes every
-// file in one batch, showing a single summary notification.
+// The first process becomes the "collector": it waits while the other
+// instances each enqueue their file path into a shared temp directory, then
+// exit immediately.  The collector drains the queue and processes every file
+// in one batch, showing a single summary notification.
+//
+// For large multi-selects (10+ files) Explorer does not necessarily spawn all
+// the per-file processes at once — they can arrive in separate bursts a few
+// hundred ms apart. A fixed sleep after the first arrival can elapse before
+// the stragglers enqueue, so the collector drains early and the selection
+// gets split into multiple output batches (e.g. 24 files becoming 12+9+3).
+// Instead of a fixed delay, poll the queue file and keep waiting as long as
+// it keeps growing, only draining once it has been quiet for
+// COLLECT_QUIET_MS — capped at COLLECT_MAX_MS so a wedged instance can't hang
+// the collector indefinitely.
 // ─────────────────────────────────────────────────────────────────────────────
 
-static constexpr DWORD COLLECT_MS = 350;
+static constexpr DWORD COLLECT_POLL_MS = 50;
+static constexpr DWORD COLLECT_QUIET_MS = 300;
+static constexpr DWORD COLLECT_MAX_MS = 4000;
 static const wchar_t* COLLECTOR_MUTEX_NAME = L"Local\\smi2srt_collector";
 static const wchar_t* QUEUE_WRITE_MUTEX_NAME = L"Local\\smi2srt_queue_writer";
 static const wchar_t* QUEUE_FILE_NAME = L"smi2srt_queue.txt";
-
-static const wchar_t* RENAME_COLLECTOR_MUTEX_NAME = L"Local\\subConverter_rename_collector";
-static const wchar_t* RENAME_QUEUE_WRITE_MUTEX_NAME = L"Local\\subConverter_rename_queue_writer";
-static const wchar_t* RENAME_QUEUE_FILE_NAME = L"subConverter_rename_queue.txt";
 
 std::wstring GetQueueFilePath(const wchar_t* queueFileName) {
     wchar_t tmp[MAX_PATH] = {};
@@ -2342,6 +2969,37 @@ void EnqueueFiles(const std::vector<fs::path>& files, const wchar_t* writeMutexN
 
     ReleaseMutex(writeMutex);
     CloseHandle(writeMutex);
+}
+
+// Blocks the collector until the queue file stops growing (no straggler
+// process has appended a new path for COLLECT_QUIET_MS), or until
+// COLLECT_MAX_MS total has elapsed, whichever comes first.
+void WaitForQueueToSettle(const wchar_t* queueFileName) {
+    std::wstring queuePath = GetQueueFilePath(queueFileName);
+    DWORD elapsedMs = 0;
+    DWORD quietMs = 0;
+    LONGLONG lastSize = -1;
+
+    while (elapsedMs < COLLECT_MAX_MS) {
+        Sleep(COLLECT_POLL_MS);
+        elapsedMs += COLLECT_POLL_MS;
+
+        WIN32_FILE_ATTRIBUTE_DATA data{};
+        LONGLONG curSize = 0;
+        if (GetFileAttributesExW(queuePath.c_str(), GetFileExInfoStandard, &data)) {
+            curSize = (static_cast<LONGLONG>(data.nFileSizeHigh) << 32) | static_cast<LONGLONG>(data.nFileSizeLow);
+        }
+
+        if (curSize != lastSize) {
+            lastSize = curSize;
+            quietMs = 0;
+        } else {
+            quietMs += COLLECT_POLL_MS;
+            if (quietMs >= COLLECT_QUIET_MS) {
+                return;
+            }
+        }
+    }
 }
 
 std::vector<fs::path> DrainQueue(const wchar_t* queueFileName, bool filterSubtitleExt) {
@@ -2411,279 +3069,12 @@ unsigned int ResolveWorkerCount(size_t fileCount) {
     return std::max(1u, workerCount);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Regex-based batch rename ("subConverter - 이름변경(정규식)")
-// Lists every file in the folder of the file(s) the user right-clicked and
-// lets them find/replace a regex pattern across all filenames in that folder.
-// ─────────────────────────────────────────────────────────────────────────────
-
-struct RenamePlanItem {
-    fs::path oldPath;
-    std::wstring newName;
-    bool changed;
-};
-
-struct RenameDialogContext {
-    fs::path folder;
-    std::vector<fs::path> files;
-};
-
-std::vector<RenamePlanItem> BuildRenamePlan(const std::vector<fs::path>& allFiles,
-                                             const std::wstring& pattern,
-                                             const std::wstring& replacement,
-                                             bool ignoreCase,
-                                             bool& regexValid) {
-    std::vector<RenamePlanItem> plan;
-    regexValid = true;
-
-    if (pattern.empty()) {
-        for (const auto& f : allFiles) {
-            plan.push_back({f, f.filename().wstring(), false});
-        }
-        return plan;
-    }
-
-    std::wregex re;
-    try {
-        auto flags = std::regex_constants::ECMAScript;
-        if (ignoreCase) {
-            flags |= std::regex_constants::icase;
-        }
-        re = std::wregex(pattern, flags);
-    } catch (...) {
-        regexValid = false;
-        for (const auto& f : allFiles) {
-            plan.push_back({f, f.filename().wstring(), false});
-        }
-        return plan;
-    }
-
-    for (const auto& f : allFiles) {
-        std::wstring name = f.filename().wstring();
-        bool matched = std::regex_search(name, re);
-        std::wstring newName = matched ? std::regex_replace(name, re, replacement) : name;
-        plan.push_back({f, newName, matched && newName != name && !newName.empty()});
-    }
-    return plan;
-}
-
-void RefreshRenamePreview(HWND hDlg, RenameDialogContext* ctx) {
-    wchar_t patternBuf[1024] = {};
-    wchar_t replaceBuf[1024] = {};
-    GetDlgItemTextW(hDlg, IDC_RENAME_PATTERN, patternBuf, 1024);
-    GetDlgItemTextW(hDlg, IDC_RENAME_REPLACE, replaceBuf, 1024);
-    bool ignoreCase = (IsDlgButtonChecked(hDlg, IDC_RENAME_IGNORECASE) == BST_CHECKED);
-
-    bool regexValid = true;
-    std::vector<RenamePlanItem> plan = BuildRenamePlan(ctx->files, patternBuf, replaceBuf, ignoreCase, regexValid);
-
-    HWND list = GetDlgItem(hDlg, IDC_RENAME_LIST);
-    SendMessageW(list, LB_RESETCONTENT, 0, 0);
-
-    int matchCount = 0;
-    for (const auto& item : plan) {
-        std::wstring oldName = item.oldPath.filename().wstring();
-        std::wstring line;
-        if (item.changed) {
-            line = oldName + L"  ->  " + item.newName;
-            ++matchCount;
-        } else {
-            line = oldName + L"  (변경 없음)";
-        }
-        SendMessageW(list, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(line.c_str()));
-    }
-
-    std::wstring status;
-    if (!regexValid) {
-        status = L"정규식 오류: 패턴을 확인하세요.";
-    } else if (std::wstring(patternBuf).empty()) {
-        status = L"패턴을 입력하면 미리보기가 표시됩니다. (전체 " + std::to_wstring(plan.size()) + L"개 파일)";
-    } else {
-        status = L"전체 " + std::to_wstring(plan.size()) + L"개 중 " +
-                 std::to_wstring(matchCount) + L"개 매칭됨";
-    }
-    SetDlgItemTextW(hDlg, IDC_RENAME_STATUS, status.c_str());
-    EnableWindow(GetDlgItem(hDlg, IDC_RENAME_APPLY_BTN), regexValid && matchCount > 0);
-}
-
-void ApplyRenamePlan(HWND hDlg, RenameDialogContext* ctx) {
-    wchar_t patternBuf[1024] = {};
-    wchar_t replaceBuf[1024] = {};
-    GetDlgItemTextW(hDlg, IDC_RENAME_PATTERN, patternBuf, 1024);
-    GetDlgItemTextW(hDlg, IDC_RENAME_REPLACE, replaceBuf, 1024);
-    bool ignoreCase = (IsDlgButtonChecked(hDlg, IDC_RENAME_IGNORECASE) == BST_CHECKED);
-
-    bool regexValid = true;
-    std::vector<RenamePlanItem> plan = BuildRenamePlan(ctx->files, patternBuf, replaceBuf, ignoreCase, regexValid);
-    if (!regexValid) {
-        MessageBoxW(hDlg, L"정규식이 올바르지 않습니다.", L"subConverter", MB_OK | MB_ICONERROR);
-        return;
-    }
-
-    std::vector<RenamePlanItem> toApply;
-    for (const auto& item : plan) {
-        if (item.changed) {
-            toApply.push_back(item);
-        }
-    }
-    if (toApply.empty()) {
-        MessageBoxW(hDlg, L"변경될 파일이 없습니다.", L"subConverter", MB_OK | MB_ICONINFORMATION);
-        return;
-    }
-
-    std::wstring confirmMsg = std::to_wstring(toApply.size()) + L"개 파일의 이름을 변경하시겠습니까?";
-    if (MessageBoxW(hDlg, confirmMsg.c_str(), L"subConverter", MB_YESNO | MB_ICONQUESTION) != IDYES) {
-        return;
-    }
-
-    int successCount = 0;
-    int failCount = 0;
-    for (const auto& item : toApply) {
-        fs::path target = item.oldPath.parent_path() / item.newName;
-        if (ToLowerW(target.wstring()) != ToLowerW(item.oldPath.wstring())) {
-            target = EnsureUniqueOutputPath(target);
-        }
-        std::error_code ec;
-        fs::rename(item.oldPath, target, ec);
-        if (ec) {
-            ++failCount;
-        } else {
-            ++successCount;
-        }
-    }
-
-    std::wstring resultMsg = L"성공: " + std::to_wstring(successCount) + L"개";
-    if (failCount > 0) {
-        resultMsg += L"\n실패: " + std::to_wstring(failCount) + L"개";
-    }
-    MessageBoxW(hDlg, resultMsg.c_str(), L"subConverter 이름 변경 결과", MB_OK | MB_ICONINFORMATION);
-
-    EndDialog(hDlg, 1);
-}
-
-INT_PTR CALLBACK RenameDialogProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
-    switch (msg) {
-    case WM_INITDIALOG: {
-        RenameDialogContext* ctx = reinterpret_cast<RenameDialogContext*>(lParam);
-        SetWindowLongPtrW(hDlg, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(ctx));
-        SetDlgItemTextW(hDlg, IDC_RENAME_FOLDER, ctx->folder.wstring().c_str());
-        RefreshRenamePreview(hDlg, ctx);
-        return TRUE;
-    }
-    case WM_COMMAND: {
-        RenameDialogContext* ctx = reinterpret_cast<RenameDialogContext*>(GetWindowLongPtrW(hDlg, GWLP_USERDATA));
-        if (!ctx) {
-            break;
-        }
-        int id = LOWORD(wParam);
-        int code = HIWORD(wParam);
-        if ((id == IDC_RENAME_PATTERN || id == IDC_RENAME_REPLACE) && code == EN_CHANGE) {
-            RefreshRenamePreview(hDlg, ctx);
-            return TRUE;
-        }
-        if (id == IDC_RENAME_IGNORECASE && code == BN_CLICKED) {
-            RefreshRenamePreview(hDlg, ctx);
-            return TRUE;
-        }
-        if (id == IDC_RENAME_PREVIEW_BTN) {
-            RefreshRenamePreview(hDlg, ctx);
-            return TRUE;
-        }
-        if (id == IDC_RENAME_APPLY_BTN) {
-            ApplyRenamePlan(hDlg, ctx);
-            return TRUE;
-        }
-        if (id == IDCANCEL) {
-            EndDialog(hDlg, 0);
-            return TRUE;
-        }
-        break;
-    }
-    case WM_CLOSE:
-        EndDialog(hDlg, 0);
-        return TRUE;
-    }
-    return FALSE;
-}
-
-void RunRenameMode(HINSTANCE hInstance, int argc, LPWSTR* argv) {
-    std::vector<fs::path> inputFiles;
-    for (int i = 1; i < argc; ++i) {
-        std::wstring arg = ToLowerW(argv[i]);
-        if (arg == L"/mode:rename") {
-            continue;
-        }
-        fs::path p(argv[i]);
-        std::error_code ec;
-        if (fs::is_regular_file(p, ec)) {
-            inputFiles.push_back(p);
-        }
-    }
-    if (inputFiles.empty()) {
-        return;
-    }
-
-    // Aggregate multi-selected files the same way conversion mode does, so a
-    // multi-select in Explorer (one process per file) becomes one dialog.
-    HANDLE collectorMutex = CreateMutexW(nullptr, TRUE, RENAME_COLLECTOR_MUTEX_NAME);
-    if (collectorMutex) {
-        DWORD lastErr = GetLastError();
-        if (lastErr == ERROR_ALREADY_EXISTS) {
-            EnqueueFiles(inputFiles, RENAME_QUEUE_WRITE_MUTEX_NAME, RENAME_QUEUE_FILE_NAME);
-            CloseHandle(collectorMutex);
-            return;
-        }
-
-        EnqueueFiles(inputFiles, RENAME_QUEUE_WRITE_MUTEX_NAME, RENAME_QUEUE_FILE_NAME);
-        Sleep(COLLECT_MS);
-        inputFiles = DrainQueue(RENAME_QUEUE_FILE_NAME, false);
-
-        ReleaseMutex(collectorMutex);
-        CloseHandle(collectorMutex);
-
-        if (inputFiles.empty()) {
-            return;
-        }
-    }
-
-    RenameDialogContext ctx;
-    ctx.folder = inputFiles.front().parent_path();
-
-    std::error_code ec;
-    for (const auto& entry : fs::directory_iterator(ctx.folder, ec)) {
-        if (entry.is_regular_file()) {
-            ctx.files.push_back(entry.path());
-        }
-    }
-    std::sort(ctx.files.begin(), ctx.files.end(), [](const fs::path& a, const fs::path& b) {
-        return ToLowerW(a.filename().wstring()) < ToLowerW(b.filename().wstring());
-    });
-
-    if (ctx.files.empty()) {
-        MessageBoxW(nullptr, L"대상 폴더에 파일이 없습니다.", L"subConverter", MB_OK | MB_ICONWARNING);
-        return;
-    }
-
-    DialogBoxParamW(hInstance, MAKEINTRESOURCE(IDD_RENAME), nullptr, RenameDialogProc,
-                     reinterpret_cast<LPARAM>(&ctx));
-}
-
-int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
+int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     bool silentMode = false;
     TargetFormat target = TargetFormat::ToSrt;
     DebugLog(L"launch argc=" + std::to_wstring(argc));
-
-    if (argv) {
-        for (int i = 1; i < argc; ++i) {
-            if (ToLowerW(argv[i]) == L"/mode:rename") {
-                RunRenameMode(hInstance, argc, argv);
-                LocalFree(argv);
-                return 0;
-            }
-        }
-    }
 
     if (!argv || argc <= 1) {
         if (!silentMode) {
@@ -2744,7 +3135,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
         }
 
         EnqueueFiles(inputFiles, QUEUE_WRITE_MUTEX_NAME, QUEUE_FILE_NAME);
-        Sleep(COLLECT_MS);
+        WaitForQueueToSettle(QUEUE_FILE_NAME);
         inputFiles = DrainQueue(QUEUE_FILE_NAME, true);
 
         ReleaseMutex(collectorMutex);
@@ -2758,6 +3149,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
 
     DebugLog(L"inputFiles=" + std::to_wstring(inputFiles.size()));
 
+    // Computed once up front (read-only afterwards) so every worker thread
+    // can consult the same batch-wide episode inference without re-scanning
+    // each directory per file.
+    std::map<std::wstring, int> bareEpisodes = BuildBareEpisodeNumberMap(inputFiles);
+
     std::atomic<int> success(0);
     std::vector<std::wstring> failedFiles;
     std::mutex failedMutex;
@@ -2765,7 +3161,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     unsigned int workerCount = ResolveWorkerCount(inputFiles.size());
     if (workerCount <= 1) {
         for (const fs::path& path : inputFiles) {
-            ConvertResult result = ConvertSingleFile(path, target);
+            ConvertResult result = ConvertSingleFile(path, target, bareEpisodes);
             if (result.ok) {
                 success.fetch_add(1);
             } else {
@@ -2785,7 +3181,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
                 }
 
                 const fs::path& path = inputFiles[current];
-                ConvertResult result = ConvertSingleFile(path, target);
+                ConvertResult result = ConvertSingleFile(path, target, bareEpisodes);
                 if (result.ok) {
                     success.fetch_add(1);
                 } else {

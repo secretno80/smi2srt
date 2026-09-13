@@ -24,6 +24,9 @@ Source: "install_context_menu.cmd"; DestDir: "{app}"; Flags: ignoreversion
 Source: "uninstall_context_menu.cmd"; DestDir: "{app}"; Flags: ignoreversion
 
 [Registry]
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.smi\shell\subConverter.Rename"; Flags: deletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.srt\shell\subConverter.Rename"; Flags: deletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.ass\shell\subConverter.Rename"; Flags: deletekey
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.smi\shell\subConverter.ToSmi"; ValueType: string; ValueName: ""; ValueData: "subConverter - ToSmi"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.smi\shell\subConverter.ToSmi"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\icon.ico"""; Flags: uninsdeletevalue
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.smi\shell\subConverter.ToSmi"; ValueType: string; ValueName: "MultiSelectModel"; ValueData: "Player"; Flags: uninsdeletevalue
@@ -60,15 +63,3 @@ Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.ass\shell\subConve
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.ass\shell\subConverter.ToAss"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\icon.ico"""; Flags: uninsdeletevalue
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.ass\shell\subConverter.ToAss"; ValueType: string; ValueName: "MultiSelectModel"; ValueData: "Player"; Flags: uninsdeletevalue
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.ass\shell\subConverter.ToAss\command"; ValueType: string; ValueName: ""; ValueData: """{app}\subConverter.exe"" /to:ass ""%1"""; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.smi\shell\subConverter.Rename"; ValueType: string; ValueName: ""; ValueData: "subConverter - 이름변경(정규식)"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.smi\shell\subConverter.Rename"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\icon.ico"""; Flags: uninsdeletevalue
-Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.smi\shell\subConverter.Rename"; ValueType: string; ValueName: "MultiSelectModel"; ValueData: "Player"; Flags: uninsdeletevalue
-Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.smi\shell\subConverter.Rename\command"; ValueType: string; ValueName: ""; ValueData: """{app}\subConverter.exe"" /mode:rename ""%1"""; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.srt\shell\subConverter.Rename"; ValueType: string; ValueName: ""; ValueData: "subConverter - 이름변경(정규식)"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.srt\shell\subConverter.Rename"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\icon.ico"""; Flags: uninsdeletevalue
-Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.srt\shell\subConverter.Rename"; ValueType: string; ValueName: "MultiSelectModel"; ValueData: "Player"; Flags: uninsdeletevalue
-Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.srt\shell\subConverter.Rename\command"; ValueType: string; ValueName: ""; ValueData: """{app}\subConverter.exe"" /mode:rename ""%1"""; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.ass\shell\subConverter.Rename"; ValueType: string; ValueName: ""; ValueData: "subConverter - 이름변경(정규식)"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.ass\shell\subConverter.Rename"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\icon.ico"""; Flags: uninsdeletevalue
-Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.ass\shell\subConverter.Rename"; ValueType: string; ValueName: "MultiSelectModel"; ValueData: "Player"; Flags: uninsdeletevalue
-Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.ass\shell\subConverter.Rename\command"; ValueType: string; ValueName: ""; ValueData: """{app}\subConverter.exe"" /mode:rename ""%1"""; Flags: uninsdeletekey

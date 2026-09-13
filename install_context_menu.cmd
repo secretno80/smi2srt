@@ -28,6 +28,7 @@ set "EXT=%~1"
 set "ROOT=HKCU\Software\Classes\SystemFileAssociations\%EXT%\shell"
 
 reg delete "%ROOT%\subConverter" /f >nul 2>nul
+reg delete "%ROOT%\subConverter.Rename" /f >nul 2>nul
 
 reg add "%ROOT%\subConverter.ToSmi" /ve /t REG_SZ /d "subConverter - ToSmi" /f >nul
 reg add "%ROOT%\subConverter.ToSmi" /v "Icon" /t REG_SZ /d "\"%ICO%\"" /f >nul
@@ -43,10 +44,5 @@ reg add "%ROOT%\subConverter.ToAss" /ve /t REG_SZ /d "subConverter - ToAss" /f >
 reg add "%ROOT%\subConverter.ToAss" /v "Icon" /t REG_SZ /d "\"%ICO%\"" /f >nul
 reg add "%ROOT%\subConverter.ToAss" /v "MultiSelectModel" /t REG_SZ /d "Player" /f >nul
 reg add "%ROOT%\subConverter.ToAss\command" /ve /t REG_SZ /d "\"%EXE%\" /to:ass \"%%1\"" /f >nul
-
-reg add "%ROOT%\subConverter.Rename" /ve /t REG_SZ /d "subConverter - 이름변경(정규식)" /f >nul
-reg add "%ROOT%\subConverter.Rename" /v "Icon" /t REG_SZ /d "\"%ICO%\"" /f >nul
-reg add "%ROOT%\subConverter.Rename" /v "MultiSelectModel" /t REG_SZ /d "Player" /f >nul
-reg add "%ROOT%\subConverter.Rename\command" /ve /t REG_SZ /d "\"%EXE%\" /mode:rename \"%%1\"" /f >nul
 
 exit /b 0

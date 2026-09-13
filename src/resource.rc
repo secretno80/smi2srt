@@ -4,28 +4,3 @@
 #pragma code_page(65001)
 
 IDI_APPICON ICON "icon.ico"
-
-IDD_RENAME DIALOGEX 0, 0, 340, 240
-STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "subConverter - 파일명 일괄 변경(정규식)"
-FONT 9, "맑은 고딕", 0, 0, 0x1
-BEGIN
-    LTEXT           "대상 폴더:", -1, 8, 10, 40, 8
-    LTEXT           "", IDC_RENAME_FOLDER, 52, 10, 280, 10, SS_PATHELLIPSIS | SS_NOPREFIX
-
-    LTEXT           "정규식 패턴 (파일명에서 찾을 부분):", -1, 8, 28, 260, 8
-    EDITTEXT        IDC_RENAME_PATTERN, 8, 40, 324, 14, ES_AUTOHSCROLL
-
-    LTEXT           "치환 문자열 ($1, $2 등 그룹 참조 가능, 비우면 삭제):", -1, 8, 58, 300, 8
-    EDITTEXT        IDC_RENAME_REPLACE, 8, 70, 324, 14, ES_AUTOHSCROLL
-
-    CONTROL         "대소문자 구분 안 함", IDC_RENAME_IGNORECASE, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 90, 150, 10
-    PUSHBUTTON      "미리보기 갱신", IDC_RENAME_PREVIEW_BTN, 250, 88, 82, 14, BS_DEFPUSHBUTTON
-
-    LISTBOX         IDC_RENAME_LIST, 8, 106, 324, 96, LBS_NOTIFY | LBS_DISABLENOSCROLL | WS_VSCROLL | WS_BORDER | WS_TABSTOP
-
-    LTEXT           "", IDC_RENAME_STATUS, 8, 206, 324, 10
-
-    PUSHBUTTON      "변경 적용", IDC_RENAME_APPLY_BTN, 178, 220, 72, 14
-    PUSHBUTTON      "닫기", IDCANCEL, 254, 220, 72, 14
-END
