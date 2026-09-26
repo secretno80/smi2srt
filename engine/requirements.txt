@@ -1,0 +1,4 @@
+pysubs2==1.9.0
+pycaption==2.3.10
+tinycss2==1.5.1
+webcolors==25.10.0

@@ -19,6 +19,7 @@ Name: "korean"; MessagesFile: "compiler:Languages\Korean.isl"
 
 [Files]
 Source: "build\subConverter.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "build\subConverterEngine\*"; DestDir: "{app}\subConverterEngine"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "install_context_menu.cmd"; DestDir: "{app}"; Flags: ignoreversion
 Source: "uninstall_context_menu.cmd"; DestDir: "{app}"; Flags: ignoreversion

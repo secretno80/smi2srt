@@ -41,6 +41,46 @@ if errorlevel 1 (
 
 echo [OK] 빌드 완료: %EXE%
 
+rem ── 변환 엔진(Python + pysubs2/pycaption) → build\subConverterEngine\ ──
+set VENV=%ROOT%.venv
+set PY=%VENV%\Scripts\python.exe
+if not exist "%PY%" (
+  where python >nul 2>nul
+  if errorlevel 1 (
+    echo [ERROR] python 을 찾을 수 없습니다. Python 3.11 이상을 설치하고 PATH를 설정하세요.
+    exit /b 1
+  )
+  echo [ENGINE] 가상환경 생성: %VENV%
+  python -m venv "%VENV%"
+  if errorlevel 1 exit /b 1
+)
+"%PY%" -m pip install -q -r "%ROOT%engine\requirements.txt" pyinstaller
+if errorlevel 1 (
+  echo [ERROR] 엔진 의존성 설치에 실패했습니다.
+  exit /b 1
+)
+
+echo [ENGINE] 단위 테스트
+pushd "%ROOT%engine"
+"%PY%" -W ignore -m unittest discover -s tests -t .
+if errorlevel 1 (
+  popd
+  echo [ERROR] 엔진 단위 테스트가 실패했습니다.
+  exit /b 1
+)
+popd
+
+echo [ENGINE] %OUTDIR%\subConverterEngine
+"%PY%" -m PyInstaller --noconfirm --clean --log-level WARN --console ^
+  --name subConverterEngine --paths "%ROOT%engine" ^
+  --distpath "%OUTDIR%" --workpath "%OUTDIR%\pyinstaller" --specpath "%OUTDIR%\pyinstaller" ^
+  "%ROOT%engine\run_engine.py"
+if errorlevel 1 (
+  echo [ERROR] 엔진 빌드에 실패했습니다.
+  exit /b 1
+)
+echo [OK] 엔진 빌드 완료: %OUTDIR%\subConverterEngine\subConverterEngine.exe
+
 set "ISCC="
 for /f "delims=" %%I in ('where ISCC 2^>nul') do (
     if not defined ISCC set "ISCC=%%I"

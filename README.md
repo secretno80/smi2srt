@@ -2,12 +2,31 @@
 
 Windows 탐색기 컨텍스트 메뉴에서 .smi/.srt/.ass 파일을 여러 개 한 번에 변환하는 도구입니다.
 
+## 변환 라이브러리
+
+자막 형식의 파싱·직렬화는 자체 구현하지 않고 검증된 라이브러리에 맡깁니다.
+
+| 역할 | 라이브러리 |
+| --- | --- |
+| SRT/ASS 읽기·쓰기, SAMI(SMI) 읽기, 타임스탬프 처리 | [pysubs2](https://github.com/tkarabela/pysubs2) (MIT) |
+| SAMI(SMI) 쓰기 | [pycaption](https://github.com/pbs/pycaption) (Apache-2.0) — pysubs2는 SAMI 쓰기 미지원 |
+| SMI `<STYLE>` CSS 해석 | [tinycss2](https://github.com/Kozea/tinycss2) (BSD) |
+| `<font color>` 색상명/HEX 해석 | [webcolors](https://github.com/ubernostrum/webcolors) (BSD) |
+
+pysubs2의 SAMI 읽기는 한 SYNC 안의 `<P Class=KRCC>`/`<P Class=ENCC>`를 한 줄로 합치고
+`<font color>`를 무시하며 `</BODY>`가 없으면 마지막 자막을 버리므로, `SAMIParser`를 상속해
+이 세 가지만 보강합니다(`engine/subconverter/formats.py`의 `TrackedSamiParser`).
+그 외 크레딧 제거, 언어 판별·파일명, 영상 매칭, 같은 형식 원본 보존은 subConverter 자체 규칙입니다.
+
+> 이전 자체 변환기에는 시간 표기에서 1시간을 2,400,000ms(40분)로 계산하는 버그가 있어,
+> 40분 이후 자막의 시점이 모두 틀어졌습니다(예: 45:00 → `01:05:00`). 라이브러리 전환으로 해소되었습니다.
+
 ## 구현된 기능
 
 1. `.smi`/`.srt`/`.ass` 파일을 `ToSmi`/`ToSrt`/`ToAss`로 변환
 2. 결과 파일은 원본과 같은 폴더에 생성
 3. 인코딩 자동 감지(BOM UTF-8/UTF-16, UTF-8 추정, CP949/ACP fallback)
-4. SMI `SYNC`를 기준으로 SRT 구간 생성 및 기본 싱크 보정
+4. SMI `SYNC`를 기준으로 자막 구간 생성 — SAMI 규칙대로 각 자막은 다음 `SYNC` 시점까지 표시
 5. 언어 감지 후 파일명에 언어 태그 반영 (`.ko.srt`, `.en.srt`, `.jp.srt`, 미확정은 `.srt`)
    - SMI의 `class`(예: KRCC/ENCC)는 어떤 캡션들이 같은 트랙인지 묶는 용도로만 쓰고,
      그 클래스 이름 자체(예: "ENCC"라서 영어)는 신뢰하지 않음 — 실제로 한글만 들어있는데
@@ -22,6 +41,10 @@ Windows 탐색기 컨텍스트 메뉴에서 .smi/.srt/.ass 파일을 여러 개 
      (기존에는 `Show.ko.ko.srt`처럼 중복 부착됨). 파일명의 기존 태그와 실제 감지된
      언어가 다르면(예: `Show.en.smi`인데 실제 내용은 한글) 옛 태그를 버리고 감지된
      언어로 교체됨
+   - 같은 형식 변환(`ToSmi`로 `.smi`, `ToSrt`로 `.srt` 등)도 내용은 원본 그대로 두되(크레딧만 제거),
+     실제 텍스트로 언어를 판별해 파일명에 언어 코드를 붙임 — `Movie.srt` → `Movie.ko.srt`.
+     한 파일에 여러 언어 트랙이 있는 SMI는 파일을 나눌 수 없으므로 첫 번째 트랙(플레이어가 기본으로
+     표시하는 트랙)의 언어를 사용
 6. 컨텍스트 메뉴 1차 메뉴(`subConverter - ToSmi/ToSrt/ToAss`) 지원
 8. 다중 선택 처리(`%1` + 프로세스 집계)로 여러 파일 일괄 변환
 9. 변환 완료 후 성공/실패 개수 요약 알림(0개 항목은 미표시)
@@ -33,19 +56,15 @@ Windows 탐색기 컨텍스트 메뉴에서 .smi/.srt/.ass 파일을 여러 개 
     (영상 파일이 없거나 매칭 신뢰도가 낮으면 원본 자막 파일명 유지)
 14. 출력 파일명이 이미 존재하면 `파일명 (n).확장자` 형태로 자동 생성
 15. 자막 파일이 아닌 입력은 자동 건너뜀
-16. SMI→SRT/ASS 변환 시 자막 구간(duration) 최적화: 파싱 단계에서 종료 시각을 다음 SYNC 경계로 미리 확정하여 비정상적으로 긴 구간 방지
+16. SMI→SRT/ASS 변환 시 종료 시각은 다음 SYNC 경계로 확정하여 비정상적으로 긴 구간 방지
 17. 내용 없는 언어 트랙 필터링: 빈 자막 항목만 있는 언어는 파일 생성 안 함 (예: 모두 `&nbsp;`인 영문)
 18. 크레딧(제작자 코멘트) 자동 제거를 모든 입력 포맷(smi/srt/ass)에 적용, 탐지 패턴 확장
     (이메일 주소, `Downloaded from` 류 문구, `자막:`/`번역:` 콜론 라벨, `SUB 변환 홍길동`처럼
     "by" 없이 제작 관련 단어 두 개가 겹치는 짧은 문장까지 인식)
-19. `.ass` 변환 시 동일 폴더에서 매칭된 동영상의 실제 해상도를 읽어 `PlayResX`/`PlayResY`를
-    영상 해상도에 맞추고 기본 폰트 크기(75pt 기준, 1080p)를 해상도 비율로 확대/축소
-    (mp4/mov/m4v는 ISO-BMFF `tkhd`, mkv/webm은 EBML `PixelWidth`/`PixelHeight`를 직접 파싱,
-    그 외 포맷이거나 매칭된 영상이 없으면 기존 1920x1080/75pt 기본값 사용). `<b>`/`<font
-    color>` 등 SMI 태그에서 파생된 이름 붙은 스타일(Bold, 색상별 스타일 등)과 `<font
-    size>` 태그를 닫을 때의 복귀 크기도, 별도 크기 지정이 없는 한 이 해상도 비율 기준
-    크기를 그대로 따름(과거에는 50pt/28pt로 고정되어 있어 FHD/4K 등에서 본문과 크기가
-    어긋나는 문제가 있었음)
+19. `.ass` 변환 시 스크립트 해상도·폰트 크기는 FFmpeg이 SRT/SMI→ASS 변환 시 쓰는 표준 헤더
+    (`PlayResX/PlayResY` 384x288, 폰트 크기 16, 외곽선 1)를 따름. 플레이어가 스크립트 해상도를 영상
+    크기에 맞춰 확대하므로 영상 해상도와 관계없이 화면 대비 같은 비율로 표시됨(영상 해상도를 읽어 폰트
+    크기를 계산하던 자체 기준은 제거)
 20. 실행 파일과 설치 프로그램에 아이콘 적용(`icon.png` → `icon.ico`), Windows
     "프로그램 추가/제거" 목록에도 아이콘 표시
 21. 다중 선택 시 프로세스 집계(수집) 대기를 고정 시간이 아닌 "큐 파일이 더 이상 커지지
@@ -63,17 +82,14 @@ Windows 탐색기 컨텍스트 메뉴에서 .smi/.srt/.ass 파일을 여러 개 
     정확히 매칭됨 (동일 폴더의 자막 전체를 선택했을 때만 적용 — 일부만 선택하면
     "연속 수열" 전제가 깨지므로 기존 방식으로 동작)
 
-## ASS 변환 형식 개선사항
+## ASS 변환 형식
 
-- 폰트 크기: 기본 75pt(1080p 기준), 매칭된 동영상이 있으면 그 해상도 비율로 자동 확대/축소
-  (예: 2160p(4K) 영상이면 150pt, 720p 영상이면 50pt)
-- 이 비율 크기는 `[V4+ Styles]`의 `Default` 스타일뿐 아니라, SMI의 `<b>`/`<font color>`처럼
-  크기 지정이 없는 서식에서 파생된 이름 붙은 스타일과 `<font size>` 태그 종료 시 복귀되는
-  크기에도 동일하게 적용됨 — 명시적으로 `<font size>`가 지정된 경우에만 그 실제 값을 따르고,
-  비교 대상(명시적 크기 지정)이 없는 경우에는 항상 이 해상도 비율 기본값을 기준으로 삼음
-- 스크립트 정보: `PlayResX`/`PlayResY`를 매칭된 동영상의 실제 해상도로 설정(없으면 `1920x1080`
-  기본값) → 플레이어의 일관된 스케일링과 적절한 폰트 크기 보장
-- 문자 인코딩: UTF-8 표준화 (`Encoding: 0`) → 한글/다국어 호환성 증대
+- 스크립트 정보·기본 스타일: FFmpeg 기본 ASS 헤더와 동일한 값(384x288, 16pt, 흰색, 외곽선 1, 하단 중앙,
+  여백 10) — 폰트만 한글 글리프가 있는 `맑은 고딕`
+- SMI 서식: `<b>`/`<i>`/`<u>`/`<s>`/`<br>`은 pysubs2, `<font color>`는 보강 파서가 ASS 태그로 변환.
+  `<font size>`/`face`는 반영하지 않음(기본 스타일 크기 유지)
+- SMI `<STYLE>`의 `font-weight`(`P` 또는 클래스 선택자)가 bold면 `Bold` 스타일로 출력
+- 문자 인코딩: UTF-8(BOM), 스타일 `Encoding: 0`
 
 ## 동영상-자막 파일명 매칭 및 자동 이름 변경
 
@@ -93,7 +109,14 @@ Windows 탐색기 컨텍스트 메뉴에서 .smi/.srt/.ass 파일을 여러 개 
 
 ## 프로젝트 구조
 
-- `src/main.cpp`: 변환 프로그램 본체
+- `src/main.cpp`: 탐색기 진입점 — 다중 선택 수집 후 변환 엔진을 한 번 실행하고 결과 요약 표시
+- `engine/subconverter/`: 변환 엔진(Python)
+  - `formats.py`: 라이브러리 연동(pysubs2/pycaption/tinycss2/webcolors), SAMI 트랙 보강 파서, ASS 헤더
+  - `convert.py`: 파일 단위 변환 흐름(파싱 → 크레딧 제거 → 언어별 분리 → 쓰기)
+  - `credits.py` / `language.py` / `matching.py` / `rawedit.py`: 크레딧 판별, 언어 판별·파일명,
+    영상 매칭, 같은 형식 원본 보존 편집
+  - `cli.py`: `subConverterEngine --to srt --list 목록.txt --result 결과.txt [파일...]`
+- `engine/tests/`: 엔진 단위 테스트(`unittest`)
 - `src/resource.rc` / `src/resource.h`: 앱 아이콘 리소스
 - `icon.png` / `icon.ico`: 앱 아이콘 원본 및 실행파일에 내장되는 다중 해상도 아이콘
 - `build.bat`: MinGW-w64 기반 빌드 스크립트 (windres로 리소스 컴파일 후 g++로 링크)
@@ -103,12 +126,24 @@ Windows 탐색기 컨텍스트 메뉴에서 .smi/.srt/.ass 파일을 여러 개 
 
 ## 빌드
 
-1. MinGW-w64 `g++`/`windres` 설치 및 PATH 설정
-2. 프로젝트 루트에서 `build.bat` 실행
+1. MinGW-w64 `g++`/`windres`, Python 3.11 이상 설치 및 PATH 설정
+2. 프로젝트 루트에서 `build.bat` 실행 — `.venv` 가상환경에 `engine/requirements.txt`와 PyInstaller를
+   설치하고, 엔진 단위 테스트 통과 후 엔진을 빌드
 
 빌드 산출물:
 
 - `build/subConverter.exe` (아이콘 내장)
+- `build/subConverterEngine/subConverterEngine.exe` (PyInstaller onedir, `subConverter.exe`와 같은 폴더에 배치)
+
+엔진만 따로 실행/테스트:
+
+```
+cd engine
+python -m subconverter --to srt 파일.smi
+python -m unittest discover -s tests -t .
+```
+
+개발 중에는 환경 변수 `SUBCONVERTER_ENGINE`에 엔진 exe 경로를 지정하면 그 엔진을 사용합니다.
 
 ## 컨텍스트 메뉴 등록/해제
 
@@ -145,7 +180,7 @@ Windows 탐색기 컨텍스트 메뉴에서 .smi/.srt/.ass 파일을 여러 개 
 
 ## 설치 프로그램 생성(Inno Setup)
 
-1. `build.bat` 실행으로 `build/subConverter.exe` 생성
+1. `build.bat` 실행으로 `build/subConverter.exe`, `build/subConverterEngine/` 생성
 2. Inno Setup에서 `setup.iss` 컴파일
 3. 설치 파일은 `Output/subConverter_setup.exe`로 생성
 
