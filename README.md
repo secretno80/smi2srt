@@ -62,7 +62,7 @@ pysubs2의 SAMI 읽기는 한 SYNC 안의 `<P Class=KRCC>`/`<P Class=ENCC>`를 �
     (이메일 주소, `Downloaded from` 류 문구, `자막:`/`번역:` 콜론 라벨, `SUB 변환 홍길동`처럼
     "by" 없이 제작 관련 단어 두 개가 겹치는 짧은 문장까지 인식)
 19. `.ass` 변환 시 스크립트 해상도·폰트 크기는 FFmpeg이 SRT/SMI→ASS 변환 시 쓰는 표준 헤더
-    (`PlayResX/PlayResY` 384x288, 외곽선 1)를 따르되 기본 스타일은 폰트 크기 20, 굵게(Bold)로 지정. 플레이어가 스크립트 해상도를 영상
+    (`PlayResX/PlayResY` 384x288, 폰트 크기 16, 외곽선 1)를 따름. 플레이어가 스크립트 해상도를 영상
     크기에 맞춰 확대하므로 영상 해상도와 관계없이 화면 대비 같은 비율로 표시됨(영상 해상도를 읽어 폰트
     크기를 계산하던 자체 기준은 제거)
 20. 실행 파일과 설치 프로그램에 아이콘 적용(`icon.png` → `icon.ico`), Windows
@@ -84,12 +84,11 @@ pysubs2의 SAMI 읽기는 한 SYNC 안의 `<P Class=KRCC>`/`<P Class=ENCC>`를 �
 
 ## ASS 변환 형식
 
-- 스크립트 정보·기본 스타일: FFmpeg 기본 ASS 헤더 기반(384x288, 흰색, 외곽선 1, 하단 중앙, 여백 10)
-  — 폰트는 한글 글리프가 있는 `맑은 고딕`, 크기 20(FFmpeg 기본 16), 굵게(FFmpeg 기본 0)
+- 스크립트 정보·기본 스타일: FFmpeg 기본 ASS 헤더와 동일한 값(384x288, 16pt, 흰색, 외곽선 1, 하단 중앙,
+  여백 10) — 폰트만 한글 글리프가 있는 `맑은 고딕`
 - SMI 서식: `<b>`/`<i>`/`<u>`/`<s>`/`<br>`은 pysubs2, `<font color>`는 보강 파서가 ASS 태그로 변환.
   `<font size>`/`face`는 반영하지 않음(기본 스타일 크기 유지)
-- SMI `<STYLE>`에 `font-weight`가 없으면 굵은 `Default` 스타일을 그대로 쓰고, `P` 또는 클래스 선택자에
-  `font-weight: normal`처럼 굵지 않게 지정된 경우에만 `Normal` 스타일(Bold 0)로 출력
+- SMI `<STYLE>`의 `font-weight`(`P` 또는 클래스 선택자)가 bold면 `Bold` 스타일로 출력
 - 문자 인코딩: UTF-8(BOM), 스타일 `Encoding: 0`
 
 ## 동영상-자막 파일명 매칭 및 자동 이름 변경

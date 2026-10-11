@@ -58,23 +58,6 @@ class EngineTest(unittest.TestCase):
         self.assertEqual((subs.info["PlayResX"], subs.info["PlayResY"]), tuple(map(str, ASS_PLAY_RES)))
         self.assertEqual(subs.styles["Default"].fontsize, ASS_FONT_SIZE)
 
-    def test_smi_without_style_uses_bold_default(self):
-        src = _write(self.dir, "late.smi", LATE_SMI)
-        [ass] = convert_file(src, ".ass", {})
-        subs = pysubs2.load(ass)
-        self.assertEqual(subs.styles["Default"].fontsize, 20)
-        self.assertTrue(subs.styles["Default"].bold)
-        self.assertEqual({e.style for e in subs}, {"Default"})
-
-    def test_smi_explicit_normal_weight_stays_regular(self):
-        smi = ("<SAMI><HEAD><STYLE>P { font-weight: normal; }</STYLE></HEAD><BODY>"
-               "<SYNC Start=1000><P Class=KRCC>보통 글씨</BODY></SAMI>")
-        src = _write(self.dir, "n.smi", smi)
-        [ass] = convert_file(src, ".ass", {})
-        subs = pysubs2.load(ass)
-        self.assertEqual(subs[0].style, "Normal")
-        self.assertFalse(subs.styles["Normal"].bold)
-
     def test_multilang_smi_splits_by_class_and_detects_language(self):
         src = os.path.join(SAMPLES, "sample_multilang.smi")
         shutil.copy(src, self.dir)

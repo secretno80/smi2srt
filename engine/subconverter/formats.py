@@ -31,7 +31,7 @@ class Track:
     name: str
     events: list[SSAEvent]
     styles: dict[str, SSAStyle] = field(default_factory=dict)
-    bold: bool | None = None  # SMI CSS font-weight for this class; None = not specified
+    bold: bool = False  # SMI CSS font-weight for this class
 
 
 def visible_text(event: SSAEvent) -> str:
@@ -119,10 +119,9 @@ class TrackedSamiParser(SAMIParser):
             super().handle_data(data)
 
 
-def _css_bold_rules(css: str) -> tuple[bool | None, dict[str, bool]]:
-    """(default bold from the "P" rule, {class: bold}) from SAMI's <STYLE>.
-    None means no font-weight was given."""
-    default_bold = None
+def _css_bold_rules(css: str) -> tuple[bool, dict[str, bool]]:
+    """(default bold from the "P" rule, {class: bold}) from SAMI's <STYLE>."""
+    default_bold = False
     class_bold: dict[str, bool] = {}
     for rule in tinycss2.parse_stylesheet(css, skip_comments=True, skip_whitespace=True):
         if rule.type != "qualified-rule":
@@ -200,14 +199,12 @@ def load_tracks(ext: str, content: str) -> list[Track]:
 
 # ── Writing ──────────────────────────────────────────────────────────────────
 
-# ASS header for converted output: based on the defaults FFmpeg writes when it
-# converts SRT/SAMI to ASS (libavcodec/ass.h ASS_DEFAULT_*), but with a larger,
-# bold Default style. The script resolution is fixed and the player scales it
-# to whatever video it plays over, so the rendered size is the same share of
-# the frame on every video.
+# ASS header for converted output: the same defaults FFmpeg writes when it
+# converts SRT/SAMI to ASS (libavcodec/ass.h ASS_DEFAULT_*). The script
+# resolution is fixed and the player scales it to whatever video it plays
+# over, so the rendered size is the same share of the frame on every video.
 ASS_PLAY_RES = (384, 288)
-ASS_FONT_SIZE = 20
-ASS_DEFAULT_BOLD = True
+ASS_FONT_SIZE = 16
 
 
 def _ass_style(bold: bool) -> SSAStyle:
@@ -233,13 +230,12 @@ def write_ass(tracks: list[Track]) -> str:
         "ScaledBorderAndShadow": "yes",
         "WrapStyle": "0",
     })
-    subs.styles = {"Default": _ass_style(bold=ASS_DEFAULT_BOLD)}
+    subs.styles = {"Default": _ass_style(bold=False)}
     for track in tracks:
         style = "Default"
-        if track.bold is not None and track.bold != ASS_DEFAULT_BOLD:
-            # Only an explicit SMI font-weight overrides the Default style.
-            style = "Bold" if track.bold else "Normal"
-            subs.styles.setdefault(style, _ass_style(bold=track.bold))
+        if track.bold:
+            style = "Bold"
+            subs.styles.setdefault(style, _ass_style(bold=True))
         subs.events.extend(_copy_event(e, style) for e in track.events)
     subs.sort()
     return subs.to_string("ass")
