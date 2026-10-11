@@ -204,7 +204,7 @@ def load_tracks(ext: str, content: str) -> list[Track]:
 # resolution is fixed and the player scales it to whatever video it plays
 # over, so the rendered size is the same share of the frame on every video.
 ASS_PLAY_RES = (384, 288)
-ASS_FONT_SIZE = 16
+ASS_FONT_SIZE = 20
 
 
 def _ass_style(bold: bool) -> SSAStyle:

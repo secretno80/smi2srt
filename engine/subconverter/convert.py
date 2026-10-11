@@ -3,7 +3,7 @@
 import os
 from collections import defaultdict
 
-from .credits import credit_bounds
+from .credits import credit_indices
 from .formats import Track, load_tracks, visible_text, write_tracks
 from .io_utils import read_subtitle_text, to_crlf, write_unique_utf8
 from .language import UNDETERMINED, detect_track_language, strip_lang_suffix, tagged_name
@@ -58,7 +58,7 @@ def convert_file(input_path: str, target_ext: str, bare_episodes: EpisodeMap) ->
     if not _parse(input_ext, content):
         raise ConvertError("변환 가능한 자막 구간을 찾지 못했습니다.")
 
-    # Same format: only leading/trailing credits are cut from the raw text
+    # Same format: only credits near the start/end are cut from the raw text
     # (everything else survives byte-for-byte); the name gains the language
     # tag detected from the remaining text.
     if input_ext == target_ext:
@@ -71,8 +71,8 @@ def convert_file(input_path: str, target_ext: str, bare_episodes: EpisodeMap) ->
 
     tracks = []
     for track in _parse(input_ext, content):
-        begin, end = credit_bounds(track.events, visible_text)
-        track.events = track.events[begin:end]
+        credits = credit_indices(track.events, visible_text)
+        track.events = [e for i, e in enumerate(track.events) if i not in credits]
         if track.events:
             tracks.append(track)
     if not tracks:

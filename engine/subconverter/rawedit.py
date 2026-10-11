@@ -1,14 +1,14 @@
 """Same-format conversion (e.g. .smi -> .smi) must keep every surviving byte
 of the source as-is, so instead of parse-and-rebuild these helpers locate
-each caption's raw span in the original text and cut out only the leading/
-trailing credit captions."""
+each caption's raw span in the original text and cut out only the credit
+captions near the start/end."""
 
 import html
 import re
 
 from pysubs2 import SSAEvent
 
-from .credits import credit_bounds
+from .credits import credit_indices
 
 
 def _excise(content: str, spans: list[tuple[int, int]]) -> str:
@@ -32,8 +32,8 @@ def _html_to_plain(fragment: str) -> str:
 
 
 def _credit_spans(items: list[tuple[int, int, str]]) -> list[tuple[int, int]]:
-    begin, end = credit_bounds(items, lambda item: item[2])
-    return [(s, e) for s, e, _ in items[:begin] + items[end:]]
+    credits = credit_indices(items, lambda item: item[2])
+    return [(s, e) for i, (s, e, _) in enumerate(items) if i in credits]
 
 
 _SRT_BLOCK = re.compile(
@@ -101,8 +101,8 @@ def remove_smi_credits(content: str) -> str:
             if text:
                 items.append((block_start, clamp(block_start, block_end), text, i))
 
-    begin, end = credit_bounds(items, lambda item: item[2])
-    removed = items[:begin] + items[end:]
+    credits = credit_indices(items, lambda item: item[2])
+    removed = [it for i, it in enumerate(items) if i in credits]
     spans = [(s, e) for s, e, _, _ in removed]
 
     # Drop the <SYNC> tag itself once every caption in it was a credit.

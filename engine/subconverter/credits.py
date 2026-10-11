@@ -17,6 +17,17 @@ _CREDIT_TOKENS = (
     "자막제작", "한글자막",
 )
 
+# Translation / sync / review / production keywords: any caption near the
+# start/end that contains one is treated as a credit. Korean ones are matched
+# with spaces removed, so "자막 제작" or "번 역" count as well.
+_COMPACT_CREDIT_TOKENS = ("번역", "싱크", "검수", "제작")
+_CREDIT_KEYWORDS = re.compile(
+    r"\b(translat\w*|sync\w*|proofread\w*|review(?:ed|er|ers)?|qc"
+    r"|(?:made|created|produced)\s+by)\b")
+
+# Credit lines are searched for among this many captions at each end.
+CREDIT_SCAN_COUNT = 30
+
 _CREDIT_PATTERNS = (
     re.compile(r"\b(sync|timing|correction|corrections|modify|modified|provided|converted|conversion"
                r"|subtitle|encode|encoded|edit|edited|rip|ripped)\s+by\b"),
@@ -50,6 +61,11 @@ def is_credit_text(text: str) -> bool:
         return True
     if any(token in normalized for token in _CREDIT_TOKENS):
         return True
+    compact = normalized.replace(" ", "")
+    if any(token in compact for token in _COMPACT_CREDIT_TOKENS):
+        return True
+    if _CREDIT_KEYWORDS.search(normalized):
+        return True
     if any(p.search(normalized) for p in _CREDIT_PATTERNS):
         return True
     if _LABEL_COLON.search(raw_lower):
@@ -64,13 +80,10 @@ def is_credit_text(text: str) -> bool:
     return False
 
 
-def credit_bounds(items: Sequence[T], text_of: Callable[[T], str]) -> tuple[int, int]:
-    """Returns [begin, end) of the items that survive after stripping credit
-    lines from the front and back. Credits in the middle are left alone."""
-    begin = 0
-    while begin < len(items) and is_credit_text(text_of(items[begin])):
-        begin += 1
-    end = len(items)
-    while end > begin and is_credit_text(text_of(items[end - 1])):
-        end -= 1
-    return begin, end
+def credit_indices(items: Sequence[T], text_of: Callable[[T], str]) -> set[int]:
+    """Indices of the credit lines among the first and last CREDIT_SCAN_COUNT
+    items, even when dialogue sits between them. Credits further into the
+    middle are left alone."""
+    window = set(range(min(CREDIT_SCAN_COUNT, len(items))))
+    window |= set(range(max(0, len(items) - CREDIT_SCAN_COUNT), len(items)))
+    return {i for i in window if is_credit_text(text_of(items[i]))}

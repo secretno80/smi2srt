@@ -6,6 +6,7 @@ import unittest
 import pysubs2
 
 from subconverter.convert import convert_file
+from subconverter.credits import is_credit_text
 from subconverter.formats import ASS_FONT_SIZE, ASS_PLAY_RES, load_tracks
 from subconverter.matching import build_bare_episode_map, find_matching_video
 
@@ -72,6 +73,28 @@ class EngineTest(unittest.TestCase):
         text = _read(srt).lower()
         self.assertNotIn("smi by", text)
         self.assertNotIn("sub by", text)
+
+    def test_credit_after_dialogue_within_30_captions_is_removed(self):
+        syncs = [f"<SYNC Start={(i + 1) * 1000}><P Class=KRCC>대사 {i}번입니다" for i in range(80)]
+        syncs[3] = "<SYNC Start=4000><P Class=KRCC>자막 제작: 홍길동"
+        syncs[29] = "<SYNC Start=30000><P Class=KRCC>자막제작 홍길동"
+        syncs[40] = "<SYNC Start=41000><P Class=KRCC>자막제작 중간"  # outside both windows
+        syncs[-5] = "<SYNC Start=76000><P Class=KRCC>자막제작 홍길동"
+        src = _write(self.dir, "mid.smi", "<SAMI><BODY>\n" + "\n".join(syncs) + "\n</BODY></SAMI>")
+        [srt] = convert_file(src, ".srt", {})
+        text = _read(srt)
+        self.assertEqual(text.count("자막"), 1)
+        self.assertIn("자막제작 중간", text)
+        self.assertIn("대사 79번", text)
+        [smi] = convert_file(src, ".smi", {})
+        self.assertEqual(_read(smi).count("자막"), 1)
+
+    def test_translation_sync_review_production_keywords_are_credits(self):
+        for text in ["번역: 홍길동", "싱크 맞춤 김씨", "검 수 박씨", "제작 이씨",
+                     "Translated by Kim", "Synced by Lee", "Proofread by Park",
+                     "Reviewed by Choi", "QC: Jung", "Made by X"]:
+            self.assertTrue(is_credit_text(text), text)
+        self.assertFalse(is_credit_text("안녕하세요 반갑습니다"))
 
     def test_same_format_keeps_content_and_adds_language_tag(self):
         body = ("1\r\n00:00:01,000 --> 00:00:02,000\r\nsub by someone\r\n\r\n"
